@@ -54,54 +54,80 @@ Trois façons, au choix :
 
 | Touche / commande | Effet |
 | --- | --- |
-| `Entrée` / `Maj+Entrée` | envoyer / nouvelle ligne |
+| `Entrée` / `Maj+Entrée` | envoyer / nouvelle ligne (pendant que l'agent travaille, le message part en **file d'attente**) |
 | `Tab` | Build → Plan → Savvy Flow |
+| `↑` / `↓` | historique des prompts (brouillon conservé par session) |
 | `Échap` | interrompre |
 | `@chemin` | joindre un fichier (autocomplétion) |
+| `Ctrl+K` · `Alt+N` · `Ctrl+B` · `Ctrl+.` | palette · nouvelle session · barre latérale · panneau latéral |
 | `/flow <tâche>` | lancer savvy-flow |
+| `/goal <condition>` | mode objectif : l'agent continue jusqu'à ce qu'un évaluateur confirme la condition |
+| `/undo` | annuler le dernier tour (fichiers **et** conversation, via snapshot git) |
+| `/compact` · `/fork` · `/report` · `/auto` | résumer le contexte · bifurquer la session · télécharger le rapport · mode autonome |
 | `/new`, `/build`, `/plan`, `/agents`, `/settings`, `/init`, `/help` | — |
 
-`/init` demande à l'agent build de créer ou mettre à jour `AGENTS.md` ; ce fichier (ou `CLAUDE.md`) est ensuite injecté dans le prompt de tous les agents.
+`/init` crée ou met à jour `AGENTS.md` ; ce fichier (ou `CLAUDE.md`) est injecté dans le prompt de tous les agents.
 
-**Autorisations.** Par défaut les modifications de fichiers sont autorisées et les commandes shell demandent confirmation (*Autoriser une fois* / *Toujours pour cette session* / *Refuser*). Les agents ne peuvent pas sortir du dossier de la session.
+**Autorisations.** Modifications de fichiers autorisées, shell sur demande (*une fois* / *toujours* — mémorisé par motif de commande, ex. `npm test*` / *refuser*). Des **règles shell** (`git status* = allow`, `git push* = deny`, `sudo * = deny`…) s'appliquent sous-commande par sous-commande (`&&`, `;`, `|`). Le **mode autonome** accorde tout ce qui serait demandé (les refus restent) : à activer pour les longues sessions sans surveillance. Valider un plan pré-autorise ses commandes de vérification. Les agents ne peuvent pas sortir du dossier de la session.
 
-### Le déroulé savvy-flow
+## Harnais : ce qui le rend fiable sur 10-15 h
 
-```
- /flow <tâche>
-     │
-     ▼
- PLAN ── l'orchestrateur lit le projet (outils lecture seule) et rend un plan JSON :
-     │   tâches (titre, niveau, dépendances, brief autonome, vérification), specs de design,
-     │   questions éventuelles, SPEC si projet vierge
-     ▼
- [votre validation]  ← ou répondez dans le prompt pour faire réviser le plan
-     │
-     ▼
- DESIGN (si l'UI est touchée : les specs sont injectées dans chaque brief, les workers n'inventent rien)
-     │
-     ▼
- DELEGATE ── workers par niveau, dans l'ordre des dépendances (N en parallèle, réglable)
-     │          chaque worker déclare ses étapes (outil `step`) → panneau Agents
-     ▼
- REVIEW ── l'orchestrateur relit le diff réel, relance la vérif si besoin
-     │       accept → tâche acceptée (+ commit git optionnel)
-     │       return → renvoyée avec les défauts, même niveau ou plus haut (2 tours max)
-     ▼
- CLOSE ── synthèse : ce qui a changé, ce qui est vérifié, ce qui reste
-```
+Inspiré du code d'[OpenCode](https://github.com/sst/opencode) et d'[OpenClaude](https://github.com/Twigpine/openclaude) :
 
-Projet vierge (dossier vide) : l'orchestrateur écrit aussi une SPEC (`docs/SPEC.md`), la tâche 1 est toujours le **scaffold** (avec `AGENTS.md` et `filemap.md`), et `docs/PLAN.md` est tenu à jour à chaque tâche acceptée.
+| # | Amélioration | Effet |
+| --- | --- | --- |
+| 1 | `edit` tolérant (exact → guillemets/tirets normalisés → espaces de fin → indentation ; préfixes de numéros de ligne retirés ; CRLF conservé) | bien moins d'échecs d'édition avec les modèles locaux |
+| 2 | `multiedit` atomique | plusieurs changements d'un fichier en un appel, tout ou rien |
+| 3 | `apply_patch` (format OpenCode) | créer / modifier / déplacer / supprimer plusieurs fichiers en un appel |
+| 4 | lecture obligatoire avant édition + détection de fichier modifié depuis la lecture | aucun worker n'écrase le travail d'un autre en parallèle |
+| 5 | verrous par fichier | écritures concurrentes sérialisées |
+| 6 | sorties longues coupées + fichier complet relisible | moins de tokens, rien de perdu |
+| 7 | élagage des vieilles sorties d'outils | contexte stable sur des centaines d'appels |
+| 8 | compaction en point de contrôle structuré (objectif, décisions, état, prochaine étape, fichiers) — le brief reste épinglé | les longues tâches ne débordent jamais du contexte |
+| 9 | reprise sur dépassement de contexte | compaction forcée puis nouvel essai |
+| 10 | retries avec backoff exponentiel + jitter (connexion, 5xx, 429, timeouts) | un serveur LLM qui hoquette ne tue pas la nuit |
+| 11 | garde-fou anti-boucle (appels identiques répétés) + relance après échecs en série | pas de tokens brûlés en boucle |
+| 12 | budget d'étapes avec rapport final forcé | chaque worker finit proprement |
+| 13 | snapshots git fantômes (`/undo`, fichiers modifiés, diff, restauration par fichier) | tout est réversible, sans toucher à votre `.git` |
+| 14 | reprise automatique des flows après crash / redémarrage | une coupure à 3 h du matin ne perd pas la nuit |
+| 15 | règles de permission par motif + « toujours » par commande + mode autonome | aucune session bloquée sur une question |
+| 16 | outil `repomap` (fichiers les plus référencés + signatures) injecté au planificateur | moins d'exploration, meilleurs plans |
+| 17 | outils `question`, `webfetch`, `notes` (contrats partagés entre workers) | décisions explicites, docs à portée, cohérence en parallèle |
+| 18 | mode objectif (`/goal`) avec évaluateur | travail continu jusqu'à un critère vérifiable |
+| 19 | auto-vérification + auto-correction avant la revue, escalade de niveau, timeout par tâche | moins de tours de revue, pas de tâche bloquée |
+| 20 | journal JSONL + rapport Markdown + `docs/PLAN.md` / `docs/FLOW_REPORT.md` + commits git tracés | traçabilité complète de ce qui a été fait, par qui, avec quel résultat |
 
-Contrairement au skill d'origine où le modèle enchaîne tout lui-même, ici **le séquencement est piloté par le serveur Python** et le LLM joue chaque rôle (planificateur, worker, relecteur). C'est volontaire : un modèle local de 7 à 30B tient mal une orchestration longue, alors qu'il s'en sort bien sur des étapes courtes au format de sortie strict. La barre de progression reste juste même si le modèle oublie de se déclarer.
+Plus : fork de session, compaction manuelle, prompts système à préfixe stable (cache KV des serveurs locaux).
 
-| Niveau | Effort par défaut | Budget d'outils | Pour |
-| --- | --- | --- | --- |
-| 🧑‍🚀 fable | high | 30 | logique et bugs les plus durs (réserve) |
-| 🕵️ heavy | xhigh | 40 | code inconnu, cause floue |
-| 🧑‍🔧 careful | high | 30 | changements délicats, invariants |
-| 🧑‍🍳 medium | medium | 20 | fonctionnalités standard |
-| 🏎️ light | low | 12 | éditions mécaniques, builds, tests |
+### Découpage du plan initial
+
+Pour une grosse demande (une app entière), l'orchestrateur procède en deux temps :
+
+1. **Architecte** : il lit le projet (repo map) et découpe en **modules homogènes** (une couche ou une fonctionnalité chacun : modèle de données, API, auth, pages, tests…), chacun avec ses fichiers, ses **contrats** (signatures, routes, types exposés aux autres modules) et ses dépendances. Petite demande : liste de tâches directe.
+2. **Un appel JSON court par module** produit 2 à 8 tâches de taille comparable, avec taille (S/M/L), complexité (1-5), fichiers possédés, dépendances minimales, brief autonome et commande de vérification.
+
+Puis le planificateur (`backend/planner.py`) :
+- **découpe** les tâches trop grosses (L et complexité ≥ 4, brief énorme, trop de fichiers) en 2-4 sous-tâches ;
+- **fusionne** les chaînes de micro-tâches (moins de démarrages de workers = moins de tokens) ;
+- vérifie le **niveau** contre la complexité (une tâche de complexité 5 ne part jamais chez un worker light) ;
+- n'autorise que des dépendances vers l'arrière (pas de cycle possible), relie les modules par leurs tâches de sortie ;
+- **sérialise les conflits de fichiers** : deux tâches qui touchent les mêmes fichiers ne tournent jamais en même temps ;
+- calcule **vagues** et **chemin critique** : l'ordonnanceur lance d'abord les chaînes les plus longues, en parallèle jusqu'à `maxParallel`.
+
+Après chaque tâche : vérification automatique (le worker corrige lui-même ses échecs), revue adversariale (ou acceptation directe d'une tâche light dont la vérif passe), **porte de module** (la vérif du module quand toutes ses tâches sont acceptées), puis **phase d'intégration** : vérifications globales et, en cas d'échec, tâches de correction planifiées automatiquement.
+
+### Interface (10 améliorations)
+
+1. **Palette de commandes** (`Ctrl+K`) : commandes, panneaux, sessions.
+2. **File d'attente** : on peut écrire pendant que l'agent travaille ; envoi automatique dès qu'il est libre.
+3. **Historique des prompts** (`↑/↓`) et brouillon conservé par session.
+4. **Panneau latéral à onglets** : *Agents* (savvy-progress), *Plan* (modules, vagues, chemin critique, vérifs, tokens et durée par tâche), *Fichiers*, *Trace*.
+5. **Fichiers modifiés** : diff par fichier et restauration en un clic.
+6. **Trace** : journal en direct filtrable (décisions, outils, erreurs) et export du rapport.
+7. **Notifications** bureau + badge d'onglet (autorisation, question, fin de flow).
+8. **Appels d'outils regroupés** au-delà de 3, bouton « Aller au plus récent », défilement qui ne saute plus.
+9. **Barre d'état** : jauge de contexte, tokens, compactions, objectif, bascule *Autonome*.
+10. **Actions sur les messages** : copier, relancer, modifier et renvoyer, bifurquer d'ici ; questions de l'agent avec choix cliquables.
 
 ## Essayer sans GPU
 
@@ -123,9 +149,11 @@ Puis Réglages → LLM local → Ollama, `http://localhost:11500`, modèle `fake
  └──────────────── REST /api/*  +  SSE /api/sessions/{id}/events ──────────┘
                                    │
  FastAPI (server.py → backend/) ───┴───────────────────────────────────────┐
- │ agent.py   boucle agent : LLM ⇄ outils, autorisations, budget d'étapes  │
- │ flow.py    moteur savvy-flow : plan → design → delegate → review → close│
- │ tools.py   read/list/glob/grep/write/edit/bash/todo/step/task (sandbox) │
+ │ agent.py   boucle agent : LLM ⇄ outils, retries, compaction, anti-boucle│
+ │ flow.py    savvy-flow : plan → design → delegate → review → verify     │
+ │ planner.py découpage : modules, DAG, conflits, vagues, chemin critique  │
+ │ tools.py   read/edit/multiedit/apply_patch/bash/repomap/... (sandbox)   │
+ │ snapshot / journal / compaction / permissions / repomap / editing       │
  │ llm.py     Ollama · OpenAI-compatible · n8n, streaming, outils natifs   │
  │            ou protocole texte, séparation <think>                       │
  │ session.py sessions, runs, bus d'événements, persistance data/          │
@@ -140,7 +168,8 @@ Les données (réglages, sessions) sont dans `data/` (`ORCH_DATA_DIR` pour chang
 
 ```bash
 pip install -r requirements.txt
-python -m pytest            # backend : outils, protocole texte, autorisations, savvy-flow complet
+python -m pytest            # 48 tests : édition, patch, permissions, planificateur, snapshots, compaction,
+                            # retries, débordement, autofix, budget, reprise après crash, undo/fork, goal, flow modulaire
 cd frontend && npm run lint # typage TypeScript
 ```
 

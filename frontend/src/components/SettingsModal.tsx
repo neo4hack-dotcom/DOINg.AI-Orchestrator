@@ -6,7 +6,7 @@ import { api } from '../api';
 import { TIERS, cx } from '../util';
 import { TierChip, TierIcon } from './TierIcon';
 
-type Tab = 'llm' | 'tiers' | 'workspace' | 'flow';
+type Tab = 'llm' | 'tiers' | 'workspace' | 'flow' | 'context' | 'agent';
 
 const TIER_DESC: Record<Tier, keyof Strings> = {
   fable: 'tierFable',
@@ -28,6 +28,27 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   );
 }
 
+function Toggle({ label, checked, onChange, hint }: { label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string }) {
+  return (
+    <label className="flex items-start gap-2">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="mt-1 accent-[var(--accent)]" />
+      <span>{label}{hint && <span className="block text-[11px] text-faint">{hint}</span>}</span>
+    </label>
+  );
+}
+
+function Num({ label, value, onChange, min, max, step = 1, hint }: { label: string; value: number; onChange: (v: number) => void; min: number; max: number; step?: number; hint?: string }) {
+  return (
+    <Field label={label} hint={hint}>
+      <input className={inputCls} type="number" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} />
+    </Field>
+  );
+}
+
+const rulesToText = (rules: AppConfig['permissions']['bashRules']) => rules.map((r) => `${r.pattern} = ${r.action}`).join('\n');
+const textToRules = (text: string): AppConfig['permissions']['bashRules'] =>
+  text.split('\n').map((l) => /^(.+?)\s*=\s*(allow|ask|deny)\s*$/.exec(l.trim())).filter(Boolean).map((m) => ({ pattern: m![1].trim(), action: m![2] as 'allow' | 'ask' | 'deny' }));
+
 export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfig; onClose: () => void; onSaved: (c: AppConfig) => void }) {
   const t = useT();
   const [cfg, setCfg] = useState<AppConfig>(initial);
@@ -37,6 +58,8 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   const [nexusPath, setNexusPath] = useState(initial.nexusDbPath || '');
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [rulesText, setRulesText] = useState(rulesToText(initial.permissions.bashRules || []));
+  const [verifyText, setVerifyText] = useState((initial.verify?.commands || []).join('\n'));
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -46,6 +69,9 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
 
   const setLlm = (patch: Partial<AppConfig['llm']>) => setCfg((c) => ({ ...c, llm: { ...c.llm, ...patch } }));
   const setFlow = (patch: Partial<AppConfig['flow']>) => setCfg((c) => ({ ...c, flow: { ...c.flow, ...patch } }));
+  const setCtx = (patch: Partial<AppConfig['context']>) => setCfg((c) => ({ ...c, context: { ...c.context, ...patch } }));
+  const setAgent = (patch: Partial<AppConfig['agent']>) => setCfg((c) => ({ ...c, agent: { ...c.agent, ...patch } }));
+  const setPerm = (patch: Partial<AppConfig['permissions']>) => setCfg((c) => ({ ...c, permissions: { ...c.permissions, ...patch } }));
   const setTier = (tier: Tier, patch: Partial<AppConfig['tiers'][Tier]>) =>
     setCfg((c) => ({ ...c, tiers: { ...c.tiers, [tier]: { ...c.tiers[tier], ...patch } } }));
 
@@ -77,7 +103,11 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
     setSaving(true);
     setNotice(null);
     try {
-      const saved = await api.saveConfig(cfg);
+      const saved = await api.saveConfig({
+        ...cfg,
+        permissions: { ...cfg.permissions, bashRules: textToRules(rulesText) },
+        verify: { ...cfg.verify, commands: verifyText.split('\n').map((x) => x.trim()).filter(Boolean) },
+      });
       onSaved(saved);
       onClose();
     } catch (e: any) {
@@ -88,7 +118,7 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   };
 
   const models = test?.models || [];
-  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['flow', t.tabFlow]];
+  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['flow', t.tabFlow], ['context', t.tabContext], ['agent', t.tabAgentCfg]];
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -208,11 +238,11 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               <Field label={t.workspace} hint={t.workspaceHint}>
                 <input className={inputCls} value={cfg.workspace} onChange={(e) => setCfg((c) => ({ ...c, workspace: e.target.value }))} />
               </Field>
-              {(['edit', 'bash'] as const).map((k) => (
-                <Field key={k} label={k === 'edit' ? t.permEdit : t.permBash}>
+              {(['edit', 'bash', 'webfetch'] as const).map((k) => (
+                <Field key={k} label={k === 'edit' ? t.permEdit : k === 'bash' ? t.permBash : t.permWeb}>
                   <div className="flex gap-1.5">
                     {(['allow', 'ask', 'deny'] as const).map((v) => (
-                      <button key={v} type="button" onClick={() => setCfg((c) => ({ ...c, permissions: { ...c.permissions, [k]: v } }))}
+                      <button key={v} type="button" onClick={() => setPerm({ [k]: v })}
                         className={cx('rounded border px-3 py-1 text-[12px]', cfg.permissions[k] === v ? 'border-accent bg-accent/10 text-accent' : 'border-line text-muted hover:text-fg')}>
                         {v === 'allow' ? t.permAllow : v === 'ask' ? t.permAsk : t.permDeny}
                       </button>
@@ -220,6 +250,13 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
                   </div>
                 </Field>
               ))}
+              <Toggle label={t.autonomous} hint={t.autonomousHint} checked={cfg.permissions.autonomous} onChange={(v) => setPerm({ autonomous: v })} />
+              <Field label={t.bashRules}>
+                <textarea className={`${inputCls} min-h-[140px] text-[12px]`} value={rulesText} onChange={(e) => setRulesText(e.target.value)} spellCheck={false} />
+              </Field>
+              <Field label={t.verifyCommands}>
+                <textarea className={`${inputCls} min-h-[64px] text-[12px]`} value={verifyText} onChange={(e) => setVerifyText(e.target.value)} placeholder="npm run build&#10;pytest -q" spellCheck={false} />
+              </Field>
               <Field label={t.language}>
                 <select className={inputCls} value={cfg.language} onChange={(e) => setCfg((c) => ({ ...c, language: e.target.value as AppConfig['language'] }))}>
                   <option value="auto">auto</option>
@@ -232,27 +269,49 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
 
           {tab === 'flow' && (
             <>
-              <label className="flex items-center gap-2">
-                <input type="checkbox" checked={cfg.flow.requirePlanApproval} onChange={(e) => setFlow({ requirePlanApproval: e.target.checked })} className="accent-[var(--accent)]" />
-                {t.requireApproval}
-              </label>
-              <label className="flex items-center gap-2">
-                <input type="checkbox" checked={cfg.flow.gitCommit} onChange={(e) => setFlow({ gitCommit: e.target.checked })} className="accent-[var(--accent)]" />
-                {t.gitCommit}
-              </label>
+              <Toggle label={t.requireApproval} checked={cfg.flow.requirePlanApproval} onChange={(v) => setFlow({ requirePlanApproval: v })} />
+              <Toggle label={t.hierarchical} checked={cfg.flow.hierarchical} onChange={(v) => setFlow({ hierarchical: v })} />
+              <Toggle label={t.splitLarge} checked={cfg.flow.splitLargeTasks} onChange={(v) => setFlow({ splitLargeTasks: v })} />
+              <Toggle label={t.mergeSmall} checked={cfg.flow.mergeSmallTasks} onChange={(v) => setFlow({ mergeSmallTasks: v })} />
+              <Toggle label={t.autoVerify} checked={cfg.flow.autoVerify} onChange={(v) => setFlow({ autoVerify: v })} />
+              <Toggle label={t.fastAcceptLight} checked={cfg.flow.fastAcceptLight} onChange={(v) => setFlow({ fastAcceptLight: v })} />
+              <Toggle label={t.escalate} checked={cfg.flow.escalateOnFail} onChange={(v) => setFlow({ escalateOnFail: v })} />
+              <Toggle label={t.autoResume} checked={cfg.flow.autoResume} onChange={(v) => setFlow({ autoResume: v })} />
+              <Toggle label={t.writeReport} checked={cfg.flow.writeReport} onChange={(v) => setFlow({ writeReport: v })} />
+              <Toggle label={t.gitCommit} checked={cfg.flow.gitCommit} onChange={(v) => setFlow({ gitCommit: v })} />
               <div className="grid gap-3 sm:grid-cols-2">
-                <Field label={t.maxParallel} hint={t.maxParallelHint}>
-                  <input className={inputCls} type="number" min={1} max={8} value={cfg.flow.maxParallel} onChange={(e) => setFlow({ maxParallel: Number(e.target.value) })} />
-                </Field>
-                <Field label={t.maxReturnRounds}>
-                  <input className={inputCls} type="number" min={0} max={5} value={cfg.flow.maxReturnRounds} onChange={(e) => setFlow({ maxReturnRounds: Number(e.target.value) })} />
-                </Field>
-                <Field label={t.planSteps}>
-                  <input className={inputCls} type="number" min={0} max={30} value={cfg.flow.planSteps} onChange={(e) => setFlow({ planSteps: Number(e.target.value) })} />
-                </Field>
-                <Field label={t.reviewSteps}>
-                  <input className={inputCls} type="number" min={0} max={30} value={cfg.flow.reviewSteps} onChange={(e) => setFlow({ reviewSteps: Number(e.target.value) })} />
-                </Field>
+                <Num label={t.maxParallel} hint={t.maxParallelHint} value={cfg.flow.maxParallel} min={1} max={8} onChange={(v) => setFlow({ maxParallel: v })} />
+                <Num label={t.maxReturnRounds} value={cfg.flow.maxReturnRounds} min={0} max={5} onChange={(v) => setFlow({ maxReturnRounds: v })} />
+                <Num label={t.autoFixRetries} value={cfg.flow.autoFixRetries} min={0} max={5} onChange={(v) => setFlow({ autoFixRetries: v })} />
+                <Num label={t.integrationRounds} value={cfg.flow.integrationRounds} min={0} max={5} onChange={(v) => setFlow({ integrationRounds: v })} />
+                <Num label={t.taskTimeout} value={cfg.flow.taskTimeoutMinutes} min={1} max={600} onChange={(v) => setFlow({ taskTimeoutMinutes: v })} />
+                <Num label={t.tokenBudget} value={cfg.flow.tokenBudget} min={0} max={1_000_000_000} step={100000} onChange={(v) => setFlow({ tokenBudget: v })} />
+                <Num label={t.planSteps} value={cfg.flow.planSteps} min={0} max={30} onChange={(v) => setFlow({ planSteps: v })} />
+                <Num label={t.reviewSteps} value={cfg.flow.reviewSteps} min={0} max={30} onChange={(v) => setFlow({ reviewSteps: v })} />
+              </div>
+            </>
+          )}
+
+          {tab === 'context' && (
+            <>
+              <Toggle label={t.repoMap} checked={cfg.context.repoMap} onChange={(v) => setCtx({ repoMap: v })} />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Num label={t.repoMapChars} value={cfg.context.repoMapChars} min={500} max={40000} step={500} onChange={(v) => setCtx({ repoMapChars: v })} />
+                <Num label={t.toolOutputMax} value={cfg.context.toolOutputMaxChars} min={1000} max={200000} step={1000} onChange={(v) => setCtx({ toolOutputMaxChars: v })} />
+                <Num label={t.pruneAt} value={cfg.context.pruneAt} min={0.1} max={0.95} step={0.05} onChange={(v) => setCtx({ pruneAt: v })} />
+                <Num label={t.compactAt} value={cfg.context.compactAt} min={0.2} max={0.95} step={0.05} onChange={(v) => setCtx({ compactAt: v })} />
+                <Num label={t.keepRecent} value={cfg.context.keepRecentShare} min={0.1} max={0.6} step={0.05} onChange={(v) => setCtx({ keepRecentShare: v })} />
+              </div>
+            </>
+          )}
+
+          {tab === 'agent' && (
+            <>
+              <Toggle label={t.readBeforeEdit} checked={cfg.agent.requireReadBeforeEdit} onChange={(v) => setAgent({ requireReadBeforeEdit: v })} />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Num label={t.maxRetries} value={cfg.agent.maxRetries} min={0} max={10} onChange={(v) => setAgent({ maxRetries: v })} />
+                <Num label={t.doomLoop} value={cfg.agent.doomLoopThreshold} min={2} max={10} onChange={(v) => setAgent({ doomLoopThreshold: v })} />
+                <Num label={t.goalMax} value={cfg.agent.goalMaxContinuations} min={1} max={100} onChange={(v) => setAgent({ goalMaxContinuations: v })} />
               </div>
             </>
           )}

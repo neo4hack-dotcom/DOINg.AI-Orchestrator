@@ -43,8 +43,29 @@ export function PlanCard({ part, flow, isLatest, onApprove, busy }: {
           </div>
         )}
 
+        {part.stats && part.tasks.length > 0 && (
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-faint">
+            {part.mode === 'modular' && <span><b className="text-fg">{part.modules?.length}</b> {t.modules.toLowerCase()}</span>}
+            <span><b className="text-fg">{part.tasks.length}</b> {t.tasks.toLowerCase()}</span>
+            <span><b className="text-fg">{part.stats.waves}</b> {t.waves}</span>
+            <span><b className="text-fg">{part.stats.maxWidth}</b> {t.maxWidth}</span>
+            {part.stats.conflictEdges > 0 && <span><b className="text-fg">{part.stats.conflictEdges}</b> {t.conflictEdges}</span>}
+            {part.stats.merged > 0 && <span><b className="text-fg">{part.stats.merged}</b> {t.mergedTasks}</span>}
+          </div>
+        )}
+
+        {part.modules && part.modules.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {part.modules.map((m) => (
+              <span key={m.id} title={m.goal} className="rounded border border-line px-1.5 py-0.5 text-[11px] text-muted">
+                <b className="text-fg">{m.id}</b> {m.name}{m.dependsOn.length > 0 && <span className="text-faint"> ← {m.dependsOn.join(', ')}</span>}
+              </span>
+            ))}
+          </div>
+        )}
+
         {part.tasks.length > 0 && (
-          <ol className="divide-y divide-line rounded border border-line">
+          <ol className="max-h-[420px] divide-y divide-line overflow-y-auto rounded border border-line">
             {part.tasks.map((task) => {
               const st = statusOf(task.n);
               const open = openTask === task.n;
@@ -60,7 +81,10 @@ export function PlanCard({ part, flow, isLatest, onApprove, busy }: {
                     <TierIcon tier={task.tier} active={st === 'running'} size={14} />
                     <span className={`min-w-0 truncate ${st === 'accepted' ? 'text-muted line-through decoration-faint' : 'text-fg'}`}>{task.title}</span>
                     <span className="ml-auto flex shrink-0 items-center gap-2">
-                      {task.after.length > 0 && <span className="text-[11px] text-faint">{t.after} {task.after.join(', ')}</span>}
+                      {task.module && <span className="hidden text-[11px] text-faint sm:inline">{task.module}</span>}
+                      {task.wave !== undefined && <span className="text-[11px] text-faint">{t.wave} {task.wave}</span>}
+                      {task.size && <span className="text-[11px] text-faint">{task.size}·c{task.complexity}</span>}
+                      {task.after.length > 0 && <span className="hidden text-[11px] text-faint sm:inline">{t.after} {task.after.join(', ')}</span>}
                       <TierChip tier={task.tier} />
                     </span>
                   </button>
@@ -68,12 +92,18 @@ export function PlanCard({ part, flow, isLatest, onApprove, busy }: {
                     <div className="space-y-1 px-9 pb-2 text-[12px] text-muted">
                       <div className="whitespace-pre-wrap">{task.brief}</div>
                       {task.verify && <div><span className="text-faint">{t.verify}:</span> {task.verify}</div>}
+                      {task.verifyCommand && <div><span className="text-faint">$</span> <code>{task.verifyCommand}</code></div>}
+                      {task.files && task.files.length > 0 && <div className="text-faint">{task.files.join('  ')}</div>}
                     </div>
                   )}
                 </li>
               );
             })}
           </ol>
+        )}
+
+        {part.verifyCommands && part.verifyCommands.length > 0 && (
+          <div className="text-[11px] text-faint">{t.integration}: {part.verifyCommands.map((c) => <code key={c} className="mr-2 text-muted">{c}</code>)}</div>
         )}
 
         {part.design && (

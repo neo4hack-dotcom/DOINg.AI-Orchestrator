@@ -27,7 +27,7 @@ export function ProgressBar({ flow, runs, panelOpen, onTogglePanel, onApprove, o
   else if (flow.phase === 'design') label = t.phaseDesign;
   else {
     const count = flow.total ? `${flow.done}/${flow.total}` : `${flow.running} ${t.busy}`;
-    label = `${flow.phase === 'review' ? t.phaseReview : t.phaseTasks} ${count}`;
+    label = `${flow.phase === 'review' ? t.phaseReview : flow.phase === 'verify' ? t.phaseVerify : t.phaseTasks} ${count}`;
   }
   const ratio = !flow ? 0 : flow.isFinished ? 1 : flow.total ? flow.done / flow.total : 0;
   const awaiting = flow && !flow.isFinished && (flow.awaiting === 'approval' || flow.interrupted);

@@ -1,4 +1,5 @@
-import { Plus, Settings, Trash2, Workflow } from 'lucide-react';
+import { useState } from 'react';
+import { Plus, Search, Settings, Target, Trash2, Workflow } from 'lucide-react';
 import type { AppConfig, SessionSummary } from '../types';
 import { useT } from '../i18n';
 import { agentColor, cx, fmtAgo } from '../util';
@@ -15,6 +16,8 @@ export function Sidebar({ sessions, currentId, onSelect, onNew, onDelete, onSett
   lang: string;
 }) {
   const t = useT();
+  const [q, setQ] = useState('');
+  const shown = q.trim() ? sessions.filter((s) => s.title.toLowerCase().includes(q.trim().toLowerCase())) : sessions;
   return (
     <nav className="flex h-full w-full flex-col border-r border-line bg-panel" aria-label={t.sessions}>
       <div className="flex items-center gap-2 px-3 pb-2 pt-3">
@@ -29,10 +32,17 @@ export function Sidebar({ sessions, currentId, onSelect, onNew, onDelete, onSett
           <Plus size={14} /> {t.newSession}
         </button>
       </div>
+      {sessions.length > 6 && (
+        <div className="mx-2 mb-1 flex items-center gap-1.5 rounded border border-line px-2 py-1">
+          <Search size={12} className="text-faint" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={t.searchSessions} aria-label={t.searchSessions}
+            className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-faint" />
+        </div>
+      )}
       <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t.sessions}</div>
       <ul className="flex-1 space-y-0.5 overflow-y-auto px-2 pb-2">
         {sessions.length === 0 && <li className="px-2 py-1 text-[12px] text-faint">{t.noSessions}</li>}
-        {sessions.map((s) => (
+        {shown.map((s) => (
           <li key={s.id} className="group relative">
             <button
               type="button"
@@ -45,6 +55,7 @@ export function Sidebar({ sessions, currentId, onSelect, onNew, onDelete, onSett
               </div>
               <div className="flex min-w-0 items-center gap-1.5 pl-3 text-[11px] text-faint">
                 {s.flowTitle && <Workflow size={10} className="shrink-0 text-flow" />}
+                {s.goalActive && <Target size={10} className="shrink-0 text-accent" />}
                 <span className="truncate">{fmtAgo(s.updatedAt, lang)}</span>
               </div>
             </button>

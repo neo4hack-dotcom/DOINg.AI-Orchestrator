@@ -225,7 +225,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=11500)
     parser.add_argument("--no-tools", action="store_true")
     parser.add_argument("--delay", type=float, default=0.02)
+    parser.add_argument("--plan-mode", choices=["simple", "modular"], default="simple")
     a = parser.parse_args()
+    STATE["plan_mode"] = a.plan_mode
     STATE["no_tools"] = a.no_tools
     STATE["delay"] = a.delay
     uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="warning")

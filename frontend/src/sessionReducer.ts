@@ -7,7 +7,8 @@ type MsgList = Message[];
 
 function withMessages(s: Session, runId: string | null, fn: (list: MsgList) => MsgList): Session {
   if (!runId) return { ...s, messages: fn(s.messages) };
-  const runs = s.runs.map((r) => (r.id === runId ? { ...r, messages: fn(r.messages || []) } : r));
+  // Worker transcripts are loaded on demand: ignore events for runs not loaded yet.
+  const runs = s.runs.map((r) => (r.id === runId && r.messages ? { ...r, messages: fn(r.messages) } : r));
   return { ...s, runs };
 }
 
@@ -46,7 +47,7 @@ export function applyEvent(s: Session, e: ServerEvent): Session {
       );
     case 'run.updated': {
       const i = s.runs.findIndex((r) => r.id === e.run.id);
-      if (i < 0) return { ...s, runs: [...s.runs, { ...e.run, messages: [] } as AgentRun] };
+      if (i < 0) return { ...s, runs: [...s.runs, { ...e.run, messages: [] } as AgentRun] };  // new run: live from start
       const runs = s.runs.slice();
       runs[i] = { ...runs[i], ...e.run };
       return { ...s, runs };
@@ -59,6 +60,12 @@ export function applyEvent(s: Session, e: ServerEvent): Session {
       return { ...s, pendingPermissions: [...s.pendingPermissions.filter((p) => p.id !== e.permission.id), e.permission] };
     case 'permission.resolved':
       return { ...s, pendingPermissions: s.pendingPermissions.filter((p) => p.id !== e.permission.id) };
+    case 'question.asked':
+      return { ...s, pendingQuestions: [...(s.pendingQuestions || []).filter((q) => q.id !== e.question.id), e.question] };
+    case 'question.resolved':
+      return { ...s, pendingQuestions: (s.pendingQuestions || []).filter((q) => q.id !== e.question.id) };
+    case 'goal.updated':
+      return { ...s, goal: e.goal };
     case 'status':
       return { ...s, busy: e.busy };
     case 'session.updated':

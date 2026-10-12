@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronRight, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
 import type { AgentRun, Flow, FlowTask } from '../types';
 import { useT } from '../i18n';
 import { cx, fmtDuration, fmtTokens } from '../util';
@@ -17,13 +17,16 @@ function useNow(active: boolean) {
   return now;
 }
 
-function RunCard({ run, now, open, onToggle }: { run: AgentRun; now: number; open: boolean; onToggle: () => void }) {
+function RunCard({ run, now, open, onToggle, onLoad }: { run: AgentRun; now: number; open: boolean; onToggle: () => void; onLoad: () => void }) {
   const t = useT();
   const active = run.status === 'running';
   const hasSteps = Boolean(run.stepTotal);
   const ratio = hasSteps ? Math.min(1, (run.stepDone || 0) / (run.stepTotal || 1)) : Math.min(1, run.contextTokens / (run.contextMax || 1));
   const elapsed = (run.endedAt || now) - run.startedAt;
   const [tab, setTab] = useState<'report' | 'transcript'>(active ? 'transcript' : 'report');
+  useEffect(() => {
+    if (open && !run.messages) onLoad();
+  }, [open, run.messages]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className={cx('rounded-md border bg-panel', open ? 'border-accent/50' : 'border-line')}>
@@ -65,11 +68,22 @@ function RunCard({ run, now, open, onToggle }: { run: AgentRun; now: number; ope
               </button>
             ))}
           </div>
+          {run.verify && run.verify.length > 0 && (
+            <div className="mb-2 space-y-0.5 text-[11px]">
+              {run.verify.map((c, i) => (
+                <div key={i} className={cx('truncate', c.exitCode === 0 ? 'text-ok' : 'text-err')}>
+                  {c.exitCode === 0 ? '✓' : `✗ ${c.exitCode}`} <code>{c.command}</code>
+                </div>
+              ))}
+            </div>
+          )}
           {tab === 'report' ? (
             run.report ? <div className="text-[12px]"><Markdown text={run.report} /></div> : <div className="text-[12px] text-faint">{t.working}</div>
+          ) : !run.messages ? (
+            <Loader2 size={14} className="spin text-faint" />
           ) : (
-            <div className="max-h-[50vh] overflow-y-auto text-[12px]">
-              <Transcript messages={run.messages || []} busy={active} compact />
+            <div className="max-h-[55vh] overflow-y-auto text-[12px]">
+              <Transcript messages={run.messages} busy={active} compact />
             </div>
           )}
         </div>
@@ -94,7 +108,7 @@ function PlannedRow({ task }: { task: FlowTask }) {
   );
 }
 
-export function AgentsPanel({ runs, flow, focusRunId, onClose }: { runs: AgentRun[]; flow: Flow | null; focusRunId: string | null; onClose: () => void }) {
+export function AgentsPanel({ runs, flow, focusRunId, onLoadRun }: { runs: AgentRun[]; flow: Flow | null; focusRunId: string | null; onLoadRun: (id: string) => void }) {
   const t = useT();
   const running = runs.filter((r) => r.status === 'running');
   const finished = runs.filter((r) => r.status !== 'running').slice().reverse();
@@ -111,12 +125,7 @@ export function AgentsPanel({ runs, flow, focusRunId, onClose }: { runs: AgentRu
   const toggle = (id: string) => setOpenId((cur) => (cur === id ? null : id));
 
   return (
-    <aside className="flex h-full w-full flex-col bg-bg">
-      <div className="flex items-center gap-2 border-b border-line px-3 py-2.5">
-        <span className="font-bold">{t.agents}</span>
-        <span className="text-faint">{runs.length}</span>
-        <button type="button" onClick={onClose} className="ml-auto text-faint hover:text-fg" title={t.close}><X size={15} /></button>
-      </div>
+    <div className="flex h-full w-full flex-col">
       <div className="grid grid-cols-3 gap-px border-b border-line bg-line text-center text-[11px]">
         <div className="bg-bg py-1.5"><div className="text-faint">{t.tokens}</div><div className="tabular-nums text-fg">{fmtTokens(tokens)}</div></div>
         <div className="bg-bg py-1.5"><div className="text-faint">{t.time}</div><div className="tabular-nums text-fg">{fmtDuration(time)}</div></div>
@@ -127,7 +136,7 @@ export function AgentsPanel({ runs, flow, focusRunId, onClose }: { runs: AgentRu
         {running.length > 0 && (
           <section className="space-y-2">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-accent">{t.running} · {running.length}</h3>
-            {running.map((r) => <RunCard key={r.id} run={r} now={now} open={openId === r.id} onToggle={() => toggle(r.id)} />)}
+            {running.map((r) => <RunCard key={r.id} run={r} now={now} open={openId === r.id} onToggle={() => toggle(r.id)} onLoad={() => onLoadRun(r.id)} />)}
           </section>
         )}
         {planned.length > 0 && (
@@ -141,10 +150,10 @@ export function AgentsPanel({ runs, flow, focusRunId, onClose }: { runs: AgentRu
             <button type="button" onClick={() => setDoneCollapsed((c) => !c)} className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-faint hover:text-muted">
               {doneCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />} {t.finished} · {finished.length}
             </button>
-            {!doneCollapsed && finished.map((r) => <RunCard key={r.id} run={r} now={now} open={openId === r.id} onToggle={() => toggle(r.id)} />)}
+            {!doneCollapsed && finished.map((r) => <RunCard key={r.id} run={r} now={now} open={openId === r.id} onToggle={() => toggle(r.id)} onLoad={() => onLoadRun(r.id)} />)}
           </section>
         )}
       </div>
-    </aside>
+    </div>
   );
 }

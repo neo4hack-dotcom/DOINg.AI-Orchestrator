@@ -33,6 +33,7 @@ class Session:
         self.permissions: dict[str, asyncio.Future] = {}
         self.questions: dict[str, asyncio.Future] = {}
         self.dirty_runs: set[str] = set()
+        self.seq = 0
         self.approval: Optional[asyncio.Future] = None
         self.flow_engine: Any = None
         self._save_handle: Optional[asyncio.TimerHandle] = None
@@ -61,13 +62,15 @@ class Session:
             "updatedAt": d["updatedAt"],
             "busy": self.busy,
             "flowTitle": (d.get("flow") or {}).get("title"),
+            "goalActive": bool(d.get("goal") and d["goal"].get("status") == "active"),
+            "autonomous": bool(d.get("autonomous")),
         }
 
     def full(self) -> dict:
         # The raw LLM history stays server-side; worker transcripts are fetched per run.
         data = {k: v for k, v in self.data.items() if k not in ("history", "runs", "permissionLog", "questionLog")}
         data["runs"] = [{k: v for k, v in r.items() if k != "messages"} for r in self.data.get("runs", [])]
-        return {**data, "busy": self.busy, "pendingPermissions": self.pending_permissions(),
+        return {**data, "seq": self.seq, "busy": self.busy, "pendingPermissions": self.pending_permissions(),
                 "pendingQuestions": self.pending_questions()}
 
     def pending_permissions(self) -> list[dict]:
@@ -92,7 +95,9 @@ class Session:
 
     # -- events ----------------------------------------------------------
     def emit(self, event_type: str, payload: dict) -> None:
-        event = {"type": event_type, **payload}
+        # A monotonic sequence lets clients drop events already contained in a snapshot.
+        self.seq += 1
+        event = {"type": event_type, "seq": self.seq, **payload}
         for q in list(self.subscribers):
             try:
                 q.put_nowait(event)

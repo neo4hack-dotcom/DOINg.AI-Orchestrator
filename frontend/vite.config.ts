@@ -10,4 +10,17 @@ export default defineConfig({
     proxy: { '/api': { target: 'http://localhost:4001', changeOrigin: true } },
   },
   base: './',
+  build: {
+    rollupOptions: {
+      output: {
+        // Stable vendor chunks: an app change does not bust them.
+        manualChunks: (id) => {
+          if (!id.includes('node_modules')) return undefined;
+          if (/react-markdown|remark|micromark|mdast|unified|hast|unist|vfile|property-information|decode-named/.test(id)) return 'vendor-markdown';
+          if (id.includes('lucide-react')) return 'vendor-icons';
+          return 'vendor';
+        },
+      },
+    },
+  },
 });

@@ -24,10 +24,17 @@ export function ReviewCard({ part, onOpenRun }: { part: ReviewPart; onOpenRun: (
         <TierChip tier={part.tier} />
         {part.round > 0 && <span className="shrink-0 text-[11px] text-faint">{t.round} {part.round + 1}</span>}
         <span className="ml-auto shrink-0 text-[12px] font-semibold" style={{ color }}>
-          {part.status === 'reviewing' ? t.reviewing : accepted ? t.accepted : t.returned}
+          {part.status === 'reviewing' ? t.reviewing : part.auto ? t.autoAccepted : accepted ? t.accepted : t.returned}
         </span>
       </div>
       {part.files.length > 0 && <div className="mt-1 truncate pl-6 text-[11px] text-faint">{part.files.join('  ')}</div>}
+      {part.checks && part.checks.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-x-3 pl-6 text-[11px]">
+          {part.checks.map((c, i) => (
+            <span key={i} className={c.exitCode === 0 ? 'text-ok' : 'text-err'}>{c.exitCode === 0 ? '✓' : `✗${c.exitCode}`} <code>{c.command.slice(0, 60)}</code></span>
+          ))}
+        </div>
+      )}
       {part.note && <div className="mt-1 pl-6 text-[12px] text-muted">{part.note}</div>}
       {part.defects.length > 0 && (
         <ul className="mt-1 list-disc space-y-0.5 pl-10 text-[12px] text-warn/90">
