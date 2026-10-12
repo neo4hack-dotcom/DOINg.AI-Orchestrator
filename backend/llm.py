@@ -264,7 +264,7 @@ async def _chat_ollama(cfg, model, messages, tools, on_delta, json_mode, tempera
         "model": model,
         "messages": wire,
         "stream": True,
-        "options": {"temperature": temperature, "num_ctx": int(cfg.get("contextWindow") or 32768)},
+        "options": {"temperature": temperature, "num_ctx": int(cfg.get("contextWindow") or 16384)},
     }
     if tools:
         body["tools"] = tools

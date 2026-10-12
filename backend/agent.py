@@ -177,7 +177,7 @@ async def run_agent(
 ) -> AgentOutcome:
     """Run until the model answers without tools. ``history`` is extended in place."""
     cfg = load_config()["llm"]
-    budget = int(int(cfg.get("contextWindow") or 32768) * 0.75)
+    budget = int(int(cfg.get("contextWindow") or 16384) * 0.75)
     steps = in_tok = out_tok = 0
     final_text = ""
     exhausted = False

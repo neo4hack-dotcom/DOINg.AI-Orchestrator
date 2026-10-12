@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 
 from . import llm, prompts
 from .agent import AgentSpec, make_context, run_agent
-from .config import ROOT_DIR, load_config, read_nexus_llm_config, save_config
+from .config import CONFIG_FILE, ROOT_DIR, load_config, read_nexus_llm_config, save_config
 from .flow import FlowEngine, resume_engine, run_worker
 from .session import MessageSink, Session, new_id, store
 from .tools import IGNORED_DIRS, READ_ONLY
@@ -24,7 +25,25 @@ from .tools import IGNORED_DIRS, READ_ONLY
 DIST_DIR = ROOT_DIR / "frontend" / "dist"
 AGENTS = ("build", "plan", "flow")
 
-app = FastAPI(title="DOINg.AI Orchestrator")
+def first_run_nexus_import() -> None:
+    """First launch: reuse the LLM configured in a NEXUS.AI checkout next to this one."""
+    if CONFIG_FILE.exists():
+        return
+    try:
+        llm_cfg, path = read_nexus_llm_config("")
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
+        return
+    save_config({"llm": llm_cfg, "nexusDbPath": str(path)})
+    print(f"[orchestrator] LLM settings imported from NEXUS.AI: {path}")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    first_run_nexus_import()
+    yield
+
+
+app = FastAPI(title="DOINg.AI Orchestrator", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 

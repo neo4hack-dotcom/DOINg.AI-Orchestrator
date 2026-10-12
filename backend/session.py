@@ -62,7 +62,9 @@ class Session:
         }
 
     def full(self) -> dict:
-        return {**self.data, "busy": self.busy, "pendingPermissions": self.pending_permissions()}
+        # The raw LLM history stays server-side: the UI renders `messages`.
+        data = {k: v for k, v in self.data.items() if k != "history"}
+        return {**data, "busy": self.busy, "pendingPermissions": self.pending_permissions()}
 
     def pending_permissions(self) -> list[dict]:
         return [p for p in self.data.setdefault("permissionLog", []) if p.get("status") == "pending"]

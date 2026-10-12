@@ -34,7 +34,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # auto: native tool calling, falling back to the <tool_call> text protocol
         # when the server or model refuses tools. n8n always uses the text protocol.
         "toolMode": "auto",
-        "contextWindow": 32768,
+        "contextWindow": 16384,
         "temperature": 0.2,
         "timeout": 600,
     },

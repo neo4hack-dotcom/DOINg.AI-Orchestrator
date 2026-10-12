@@ -155,7 +155,7 @@ async def run_worker(
         "startedAt": now_ms(),
         "endedAt": None,
         "contextTokens": 0,
-        "contextMax": int(cfg["llm"].get("contextWindow") or 32768),
+        "contextMax": int(cfg["llm"].get("contextWindow") or 16384),
         "tokens": 0,
         "costUsd": 0.0,
         "steps": 0,
