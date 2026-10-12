@@ -22,11 +22,29 @@ DeltaFn = Callable[[str, str], Awaitable[None]]  # (kind: "text" | "reasoning", 
 
 
 class LLMError(Exception):
-    pass
+    def __init__(self, message: str, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
 
 class ToolsUnsupported(LLMError):
     """The server or model rejected native tool calling."""
+
+
+class ContextOverflow(LLMError):
+    """The request is larger than the model's context window."""
+
+
+_OVERFLOW_HINTS = ("context length", "context_length", "maximum context", "too many tokens", "context window",
+                   "exceeds the context", "prompt is too long", "input is too long", "num_ctx")
+
+
+def _http_error(provider: str, status: int, text: str) -> LLMError:
+    low = text.lower()
+    if any(h in low for h in _OVERFLOW_HINTS):
+        return ContextOverflow(f"{provider}: context overflow ({text[:300]})")
+    transient = status in (408, 409, 425, 429) or status >= 500 or "overloaded" in low or "busy" in low
+    return LLMError(f"{provider} HTTP {status}: {text[:500]}", transient=transient)
 
 
 @dataclass
@@ -281,7 +299,7 @@ async def _chat_ollama(cfg, model, messages, tools, on_delta, json_mode, tempera
                 text = (await res.aread()).decode("utf-8", "replace")
                 if tools and "does not support tools" in text:
                     raise ToolsUnsupported(text)
-                raise LLMError(f"Ollama HTTP {res.status_code}: {text[:500]}")
+                raise _http_error("Ollama", res.status_code, text)
             async for line in res.aiter_lines():
                 if not line.strip():
                     continue
@@ -290,7 +308,7 @@ async def _chat_ollama(cfg, model, messages, tools, on_delta, json_mode, tempera
                 except json.JSONDecodeError:
                     continue
                 if data.get("error"):
-                    raise LLMError(f"Ollama: {data['error']}")
+                    raise _http_error("Ollama", 500, str(data["error"]))
                 msg = data.get("message") or {}
                 if msg.get("thinking"):
                     acc["reasoning"] += msg["thinking"]
@@ -346,7 +364,7 @@ async def _chat_openai(cfg, model, messages, tools, on_delta, json_mode, tempera
                 text = (await res.aread()).decode("utf-8", "replace")
                 if tools and _looks_like_tool_refusal(res.status_code, text):
                     raise ToolsUnsupported(text)
-                raise LLMError(f"OpenAI-compatible HTTP {res.status_code}: {text[:500]}")
+                raise _http_error("OpenAI-compatible", res.status_code, text)
             ctype = res.headers.get("content-type", "")
             if "text/event-stream" not in ctype:
                 # Server ignored stream=true: plain JSON body.
@@ -371,7 +389,7 @@ async def _chat_openai(cfg, model, messages, tools, on_delta, json_mode, tempera
                     except json.JSONDecodeError:
                         continue
                     if data.get("error"):
-                        raise LLMError(f"OpenAI-compatible: {data['error']}")
+                        raise _http_error("OpenAI-compatible", 500, json.dumps(data["error"]))
                     usage = data.get("usage") or {}
                     if usage:
                         p_tok = usage.get("prompt_tokens", p_tok)
@@ -416,7 +434,7 @@ async def _chat_n8n(cfg, model, messages, tools, on_delta, json_mode, temperatur
     async with httpx.AsyncClient(timeout=_timeout(cfg)) as client:
         res = await client.post(url, json=body, headers=headers)
     if res.status_code >= 400:
-        raise LLMError(f"n8n HTTP {res.status_code}: {res.text[:500]}")
+        raise _http_error("n8n", res.status_code, res.text)
     try:
         data = res.json()
     except ValueError:
@@ -456,9 +474,11 @@ async def chat(
         else:
             raise LLMError(f"Unsupported provider: {provider}")
     except httpx.ConnectError as e:
-        raise LLMError(f"Cannot reach {provider} at {cfg.get('baseUrl')}: {e}") from e
+        raise LLMError(f"Cannot reach {provider} at {cfg.get('baseUrl')}: {e}", transient=True) from e
     except httpx.TimeoutException as e:
-        raise LLMError(f"{provider} timed out: {e}") from e
+        raise LLMError(f"{provider} timed out: {e}", transient=True) from e
+    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as e:
+        raise LLMError(f"{provider} connection dropped: {e}", transient=True) from e
     if not res.prompt_tokens:
         res.prompt_tokens = messages_tokens(messages)
     if not res.completion_tokens:

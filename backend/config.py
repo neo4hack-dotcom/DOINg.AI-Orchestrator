@@ -48,7 +48,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "orchestratorModel": "",
     "workspace": str(Path.cwd()),
-    "permissions": {"edit": "allow", "bash": "ask"},
+    "permissions": {
+        "edit": "allow",
+        "bash": "ask",
+        "webfetch": "ask",
+        # Evaluated per sub-command (split on && ; | ||). deny wins, then allow; else the category value.
+        "bashRules": [
+            {"pattern": "ls*", "action": "allow"},
+            {"pattern": "pwd", "action": "allow"},
+            {"pattern": "cat *", "action": "allow"},
+            {"pattern": "head *", "action": "allow"},
+            {"pattern": "tail *", "action": "allow"},
+            {"pattern": "wc *", "action": "allow"},
+            {"pattern": "find *", "action": "allow"},
+            {"pattern": "grep *", "action": "allow"},
+            {"pattern": "rg *", "action": "allow"},
+            {"pattern": "echo *", "action": "allow"},
+            {"pattern": "git status*", "action": "allow"},
+            {"pattern": "git diff*", "action": "allow"},
+            {"pattern": "git log*", "action": "allow"},
+            {"pattern": "git show*", "action": "allow"},
+            {"pattern": "sudo *", "action": "deny"},
+            {"pattern": "rm -rf /*", "action": "deny"},
+            {"pattern": "rm -rf ~*", "action": "deny"},
+            {"pattern": "git push*", "action": "deny"},
+            {"pattern": "git reset --hard*", "action": "deny"},
+            {"pattern": "shutdown*", "action": "deny"},
+            {"pattern": "reboot*", "action": "deny"},
+            {"pattern": "mkfs*", "action": "deny"},
+            {"pattern": "dd if=*", "action": "deny"},
+        ],
+        # Autonomous: every "ask" becomes "allow" (deny rules still apply). For long unattended runs.
+        "autonomous": False,
+    },
     "flow": {
         "requirePlanApproval": True,
         "maxParallel": 1,
@@ -56,6 +88,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "gitCommit": False,
         "planSteps": 8,
         "reviewSteps": 8,
+        # Plan decomposition
+        "hierarchical": True,           # modules first, then tasks per module, for large requests
+        "splitLargeTasks": True,        # ask the orchestrator to split L / very complex tasks
+        "mergeSmallTasks": True,        # merge chains of tiny tasks to save worker spin-ups
+        # Execution
+        "autoVerify": True,             # run verify commands after each worker, feed failures back
+        "autoFixRetries": 2,            # worker self-fix attempts before the review
+        "fastAcceptLight": True,        # light task + passing verify command => accepted without LLM review
+        "escalateOnFail": True,         # one last attempt one tier up before failing a task
+        "integrationRounds": 2,         # final verify + fix-task rounds
+        "taskTimeoutMinutes": 45,
+        "tokenBudget": 0,               # 0 = unlimited; stops delegating when exceeded
+        "autoResume": True,             # resume interrupted flows when the server restarts
+        "writeReport": True,            # docs/FLOW_REPORT.md at close
+    },
+    "verify": {"commands": [], "timeout": 300},
+    "context": {
+        "toolOutputMaxChars": 12000,    # longer outputs spill to a file the model can read
+        "pruneAt": 0.5,                 # clear old tool outputs above this share of the window
+        "compactAt": 0.75,              # summarize old history above this share of the window
+        "keepRecentShare": 0.3,         # share of the window kept verbatim
+        "repoMap": True,
+        "repoMapChars": 6000,
+    },
+    "agent": {
+        "maxRetries": 4,                # transient LLM errors (connection, 5xx, 429, timeout)
+        "retryBaseSeconds": 2.0,        # backoff: base * 2^attempt (+ jitter), capped at 60 s
+        "doomLoopThreshold": 3,         # identical tool calls in a row before intervening
+        "requireReadBeforeEdit": True,
+        "goalMaxContinuations": 8,
     },
     "nexusDbPath": "",
     "language": "auto",
@@ -85,9 +147,20 @@ def _sanitize(cfg: dict) -> dict:
         if tier.get("effort") not in EFFORTS:
             tier["effort"] = DEFAULT_CONFIG["tiers"][name]["effort"]
         tier["model"] = str(tier.get("model") or "")
-    for key in ("edit", "bash"):
+    for key in ("edit", "bash", "webfetch"):
         if cfg["permissions"].get(key) not in PERMISSION_VALUES:
             cfg["permissions"][key] = DEFAULT_CONFIG["permissions"][key]
+    rules = cfg["permissions"].get("bashRules")
+    if not isinstance(rules, list):
+        rules = []
+    cfg["permissions"]["bashRules"] = [
+        {"pattern": str(r.get("pattern", "")).strip(), "action": r.get("action")}
+        for r in rules
+        if isinstance(r, dict) and str(r.get("pattern", "")).strip() and r.get("action") in PERMISSION_VALUES
+    ]
+    if not isinstance(cfg["verify"].get("commands"), list):
+        cfg["verify"]["commands"] = []
+    cfg["verify"]["commands"] = [str(c).strip() for c in cfg["verify"]["commands"] if str(c).strip()]
     flow = cfg["flow"]
     flow["maxParallel"] = max(1, min(8, int(flow.get("maxParallel") or 1)))
     flow["maxReturnRounds"] = max(0, min(5, int(flow.get("maxReturnRounds") or 0)))

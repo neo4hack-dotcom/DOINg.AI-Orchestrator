@@ -34,6 +34,7 @@ async def test_edit_requires_unique_match(workspace):
 async def test_edit_tolerates_trailing_whitespace(workspace):
     c = ctx(workspace)
     (workspace / "c.py").write_text("def f():   \n    return 1\n")
+    await t_read(c, {"path": "c.py"})
     await t_edit(c, {"path": "c.py", "old_string": "def f():\n    return 1", "new_string": "def f():\n    return 2"})
     assert "return 2" in (workspace / "c.py").read_text()
 

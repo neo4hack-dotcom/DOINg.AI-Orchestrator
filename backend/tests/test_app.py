@@ -92,7 +92,7 @@ async def test_permission_ask_then_allow(client, fake_server, workspace):
     s = await wait_idle(sid)
     tool = next(p for p in all_parts(s.data) if p["type"] == "tool")
     assert tool["status"] == "done" and "hello from bash" in tool["output"]
-    assert "bash" in s.data["alwaysAllow"]
+    assert "printf*" in s.data["alwaysAllow"]
 
 
 async def test_plan_mode_cannot_edit(client, fake_server, workspace):
@@ -134,7 +134,7 @@ async def test_savvy_flow_end_to_end(client, fake_server, workspace):
 
 
 async def test_savvy_flow_return_round_escalates(client, fake_server, workspace, monkeypatch):
-    configure(fake_server, workspace, "openai_compatible", flow={"requirePlanApproval": False})
+    configure(fake_server, workspace, "openai_compatible", flow={"requirePlanApproval": False, "fastAcceptLight": False})
     original = fake_llm.brain
     seen = {"reviews": 0}
 

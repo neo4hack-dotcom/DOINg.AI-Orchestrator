@@ -31,6 +31,8 @@ class Session:
         self.subscribers: set[asyncio.Queue] = set()
         self.task: Optional[asyncio.Task] = None
         self.permissions: dict[str, asyncio.Future] = {}
+        self.questions: dict[str, asyncio.Future] = {}
+        self.dirty_runs: set[str] = set()
         self.approval: Optional[asyncio.Future] = None
         self.flow_engine: Any = None
         self._save_handle: Optional[asyncio.TimerHandle] = None
@@ -62,12 +64,31 @@ class Session:
         }
 
     def full(self) -> dict:
-        # The raw LLM history stays server-side: the UI renders `messages`.
-        data = {k: v for k, v in self.data.items() if k != "history"}
-        return {**data, "busy": self.busy, "pendingPermissions": self.pending_permissions()}
+        # The raw LLM history stays server-side; worker transcripts are fetched per run.
+        data = {k: v for k, v in self.data.items() if k not in ("history", "runs", "permissionLog", "questionLog")}
+        data["runs"] = [{k: v for k, v in r.items() if k != "messages"} for r in self.data.get("runs", [])]
+        return {**data, "busy": self.busy, "pendingPermissions": self.pending_permissions(),
+                "pendingQuestions": self.pending_questions()}
 
     def pending_permissions(self) -> list[dict]:
         return [p for p in self.data.setdefault("permissionLog", []) if p.get("status") == "pending"]
+
+    def pending_questions(self) -> list[dict]:
+        return [q for q in self.data.setdefault("questionLog", []) if q.get("status") == "pending"]
+
+    def run(self, run_id: str) -> Optional[dict]:
+        for r in self.data.get("runs", []):
+            if r["id"] == run_id:
+                if "messages" not in r:
+                    path = SESSIONS_DIR / self.id / f"{run_id}.json"
+                    try:
+                        r["messages"] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+                    except (OSError, json.JSONDecodeError):
+                        r["messages"] = []
+                    if r.get("status") != "running":
+                        close_parts(r["messages"])
+                return r
+        return None
 
     # -- events ----------------------------------------------------------
     def emit(self, event_type: str, payload: dict) -> None:
@@ -93,10 +114,21 @@ class Session:
         self._save_handle = loop.call_later(delay, self.save)
 
     def save(self) -> None:
+        """Main session file without worker transcripts; each run transcript has its own file."""
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        runs_dir = SESSIONS_DIR / self.id
+        for run in self.data.get("runs", []):
+            if run["id"] in self.dirty_runs and "messages" in run:
+                runs_dir.mkdir(parents=True, exist_ok=True)
+                rp = runs_dir / f"{run['id']}.json"
+                tmp = rp.with_suffix(".tmp")
+                tmp.write_text(json.dumps(run["messages"], ensure_ascii=False), encoding="utf-8")
+                tmp.replace(rp)
+        self.dirty_runs.clear()
+        data = {**self.data, "runs": [{k: v for k, v in r.items() if k != "messages"} for r in self.data.get("runs", [])]}
         path = SESSIONS_DIR / f"{self.id}.json"
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
 
 
@@ -113,7 +145,10 @@ class MessageSink:
 
     def _messages(self) -> list[dict]:
         if self.run is not None:
-            return self.run.setdefault("messages", [])
+            self.session.dirty_runs.add(self.run["id"])
+            if "messages" not in self.run:
+                self.session.run(self.run["id"])
+            return self.run["messages"]
         return self.session.data["messages"]
 
     def add_message(self, role: str, agent: str, model: str = "", parts: Optional[list] = None) -> dict:
@@ -138,6 +173,8 @@ class MessageSink:
         return part
 
     def update_part(self, msg: dict, part: dict) -> None:
+        if self.run is not None:
+            self.session.dirty_runs.add(self.run["id"])
         self.session.emit("part.updated", {"runId": self.run_id, "messageId": msg["id"], "part": part})
         self.session.touch()
 
@@ -163,7 +200,7 @@ class SessionStore:
         self._loaded = True
         if not SESSIONS_DIR.exists():
             return
-        for path in SESSIONS_DIR.glob("*.json"):
+        for path in SESSIONS_DIR.glob("ses_*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -195,7 +232,11 @@ class SessionStore:
             "runs": [],
             "flow": None,
             "permissionLog": [],
+            "questionLog": [],
             "alwaysAllow": [],
+            "goal": None,
+            "autonomous": False,
+            "baseSnapshot": None,
             "tokens": {"input": 0, "output": 0},
         }
         session = Session(data)
@@ -209,22 +250,32 @@ class SessionStore:
             return False
         if session.task and not session.task.done():
             session.task.cancel()
-        path = SESSIONS_DIR / f"{sid}.json"
-        if path.exists():
-            path.unlink()
+        for path in (SESSIONS_DIR / f"{sid}.json", SESSIONS_DIR / f"{sid}.journal.jsonl"):
+            if path.exists():
+                path.unlink()
+        runs_dir = SESSIONS_DIR / sid
+        if runs_dir.is_dir():
+            for f in runs_dir.iterdir():
+                f.unlink()
+            runs_dir.rmdir()
         return True
+
+
+def close_parts(messages: list[dict]) -> None:
+    for msg in messages:
+        for part in msg.get("parts", []):
+            if part.get("type") == "tool" and part.get("status") in ("pending", "running", "waiting"):
+                part["status"] = "error"
+                part["output"] = "Interrupted (server restarted)."
 
 
 def _recover_interrupted(data: dict) -> None:
     """A session saved mid-run (server stopped): close what was left running."""
-    def close_parts(messages: list[dict]) -> None:
-        for msg in messages:
-            for part in msg.get("parts", []):
-                if part.get("type") == "tool" and part.get("status") in ("pending", "running", "waiting"):
-                    part["status"] = "error"
-                    part["output"] = "Interrupted (server restarted)."
 
     close_parts(data.get("messages", []))
+    for q in data.get("questionLog", []):
+        if q.get("status") == "pending":
+            q["status"] = "rejected"
     for run in data.get("runs", []):
         close_parts(run.get("messages", []))
         if run.get("status") == "running":
@@ -235,6 +286,8 @@ def _recover_interrupted(data: dict) -> None:
             p["status"] = "rejected"
     flow = data.get("flow")
     if flow and not flow.get("isFinished"):
+        flow["wasExecuting"] = bool(flow.get("executing"))
+        flow["executing"] = False
         flow["interrupted"] = True
         flow["running"] = 0
         for t in flow.get("tasks", []):
