@@ -1,4 +1,4 @@
-"""DOINg.AI Orchestrator - start the API (and the built UI) on http://localhost:4001.
+"""DOINg.AI SuperCode - start the API (and the built UI) on http://localhost:4001.
 
     python server.py [--port 4001] [--host 127.0.0.1] [--workspace PATH]
 """
@@ -11,7 +11,7 @@ import uvicorn
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DOINg.AI Orchestrator server")
+    parser = argparse.ArgumentParser(description="DOINg.AI SuperCode server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4001)
     parser.add_argument("--workspace", help="Default project folder for new sessions")

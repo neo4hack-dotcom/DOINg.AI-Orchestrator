@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import DATA_DIR
+from .osutil import atomic_write
 
 SESSIONS_DIR = DATA_DIR / "sessions"
 
@@ -63,7 +64,7 @@ class Session:
             "busy": self.busy,
             "flowTitle": (d.get("flow") or {}).get("title"),
             "goalActive": bool(d.get("goal") and d["goal"].get("status") == "active"),
-            "autonomous": bool(d.get("autonomous")),
+            "autoMode": d.get("autoMode"),
         }
 
     def full(self) -> dict:
@@ -119,22 +120,22 @@ class Session:
         self._save_handle = loop.call_later(delay, self.save)
 
     def save(self) -> None:
+        try:
+            self._save()
+        except OSError as e:  # disk full, file locked: keep running, retry on next change
+            print(f"[supercode] could not save session {self.id}: {e}")
+
+    def _save(self) -> None:
         """Main session file without worker transcripts; each run transcript has its own file."""
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         runs_dir = SESSIONS_DIR / self.id
         for run in self.data.get("runs", []):
             if run["id"] in self.dirty_runs and "messages" in run:
                 runs_dir.mkdir(parents=True, exist_ok=True)
-                rp = runs_dir / f"{run['id']}.json"
-                tmp = rp.with_suffix(".tmp")
-                tmp.write_text(json.dumps(run["messages"], ensure_ascii=False), encoding="utf-8")
-                tmp.replace(rp)
+                atomic_write(runs_dir / f"{run['id']}.json", json.dumps(run["messages"], ensure_ascii=False))
         self.dirty_runs.clear()
         data = {**self.data, "runs": [{k: v for k, v in r.items() if k != "messages"} for r in self.data.get("runs", [])]}
-        path = SESSIONS_DIR / f"{self.id}.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        atomic_write(SESSIONS_DIR / f"{self.id}.json", json.dumps(data, ensure_ascii=False))
 
 
 class MessageSink:
@@ -240,7 +241,7 @@ class SessionStore:
             "questionLog": [],
             "alwaysAllow": [],
             "goal": None,
-            "autonomous": False,
+            "autoMode": None,
             "baseSnapshot": None,
             "tokens": {"input": 0, "output": 0},
         }
@@ -276,6 +277,8 @@ def close_parts(messages: list[dict]) -> None:
 
 def _recover_interrupted(data: dict) -> None:
     """A session saved mid-run (server stopped): close what was left running."""
+    if "autonomous" in data:  # v2 key
+        data["autoMode"] = True if data.pop("autonomous") else None
 
     close_parts(data.get("messages", []))
     for q in data.get("questionLog", []):

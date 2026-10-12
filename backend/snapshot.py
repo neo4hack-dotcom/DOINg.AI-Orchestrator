@@ -22,6 +22,8 @@ EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", "dist/", "build/
 MAX_FILE_BYTES = 5_000_000
 
 _locks: dict[str, asyncio.Lock] = {}
+# No console window flashing for each git call on Windows.
+NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 
 
 def available() -> bool:
@@ -40,7 +42,7 @@ class Snapshots:
                "GIT_AUTHOR_NAME": "orchestrator", "GIT_AUTHOR_EMAIL": "orchestrator@local",
                "GIT_COMMITTER_NAME": "orchestrator", "GIT_COMMITTER_EMAIL": "orchestrator@local"}
         res = subprocess.run(["git", *args], cwd=self.directory, env=env, input=input_,
-                             capture_output=True, timeout=120)
+                             capture_output=True, timeout=120, **NO_WINDOW)
         if check and res.returncode != 0:
             raise RuntimeError(res.stderr.decode("utf-8", "replace")[:500])
         return res.stdout.decode("utf-8", "replace")
@@ -52,6 +54,8 @@ class Snapshots:
         self._run("init", "-q")
         self._run("config", "core.autocrlf", "false")
         self._run("config", "core.quotepath", "false")
+        self._run("config", "core.longpaths", "true")
+        self._run("config", "core.safecrlf", "false")
         info = self.git_dir / "info"
         info.mkdir(exist_ok=True)
         (info / "exclude").write_text("\n".join(EXCLUDES) + "\n", encoding="utf-8")
@@ -122,7 +126,7 @@ class Snapshots:
             else:
                 blob = self._run("rev-parse", f"{tree}:{path}").strip()
                 data = subprocess.run(["git", "cat-file", "blob", blob], capture_output=True,
-                                      env={**os.environ, "GIT_DIR": str(self.git_dir)}).stdout
+                                      env={**os.environ, "GIT_DIR": str(self.git_dir)}, **NO_WINDOW).stdout
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
             touched.append(path)

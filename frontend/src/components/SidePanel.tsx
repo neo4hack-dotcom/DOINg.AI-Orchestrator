@@ -4,13 +4,14 @@ import { useT } from '../i18n';
 import { cx } from '../util';
 import { AgentsPanel } from './AgentsPanel';
 import { FilesPanel } from './FilesPanel';
+import { GitPanel } from './GitPanel';
 import { PlanBoard } from './PlanBoard';
 import { TracePanel } from './TracePanel';
 
-export type SideTab = 'agents' | 'plan' | 'files' | 'trace';
+export type SideTab = 'agents' | 'plan' | 'files' | 'git' | 'trace';
 
 /* Right panel: savvy-progress agents, the plan board, changed files and the trace. */
-export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal }: {
+export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal, onOpenSettings }: {
   tab: SideTab;
   onTab: (t: SideTab) => void;
   onClose: () => void;
@@ -23,6 +24,7 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
   busy: boolean;
   filesVersion: number;
   liveJournal: JournalEntry[];
+  onOpenSettings: () => void;
 }) {
   const t = useT();
   const running = runs.filter((r) => r.status === 'running').length;
@@ -30,6 +32,7 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
     ['agents', t.tabAgents, running || null],
     ['plan', t.tabPlan, flow ? flow.tasks.length : null],
     ['files', t.tabFiles, null],
+    ['git', t.tabGit, null],
     ['trace', t.tabTrace, null],
   ];
   return (
@@ -48,6 +51,7 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
         {tab === 'agents' && <AgentsPanel runs={runs} flow={flow} focusRunId={focusRunId} onLoadRun={onLoadRun} />}
         {tab === 'plan' && <PlanBoard flow={flow} runs={runs} onOpenRun={onOpenRun} />}
         {tab === 'files' && <FilesPanel sessionId={sessionId} busy={busy} version={filesVersion} />}
+        {tab === 'git' && <GitPanel sessionId={sessionId} busy={busy} version={filesVersion} onOpenSettings={onOpenSettings} />}
         {tab === 'trace' && <TracePanel sessionId={sessionId} live={liveJournal} />}
       </div>
     </aside>

@@ -24,7 +24,7 @@ export function Sidebar({ sessions, currentId, onSelect, onNew, onDelete, onSett
         <div className="grid h-6 w-6 place-items-center rounded bg-accent font-bold text-bg">›_</div>
         <div className="min-w-0 leading-tight">
           <div className="truncate font-bold">DOINg.AI</div>
-          <div className="truncate text-[11px] text-faint">Orchestrator</div>
+          <div className="truncate text-[11px] text-accent">SuperCode</div>
         </div>
       </div>
       <div className="px-2 pb-2">

@@ -14,6 +14,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from .osutil import posix, read_text
 from .tools import IGNORED_DIRS
 
 SOURCE_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".kt", ".cs",
@@ -135,13 +136,13 @@ def build(directory: str, budget_chars: int = 6000, focus: str = "") -> str:
             lines, names, words = cached[2], cached[3], cached[4]
         else:
             try:
-                text = p.read_text(encoding="utf-8", errors="replace")
+                text = read_text(p)
             except OSError:
                 continue
             lines, names = _defs(p, text)
             words = Counter(WORD.findall(text))
             _cache[key] = (st.st_mtime, st.st_size, lines, names, words)
-        rel = str(p.relative_to(root))
+        rel = posix(p.relative_to(root))
         defs[rel] = lines
         names_of[rel] = names
         words_of[rel] = words

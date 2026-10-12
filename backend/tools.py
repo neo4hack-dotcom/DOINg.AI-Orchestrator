@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from . import editing
-from .config import DATA_DIR
+from .config import DATA_DIR, load_config
+from .osutil import lock_key, posix, read_text, run_command, write_text
 
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".pytest_cache",
                 ".mypy_cache", ".idea", ".vscode", "target", ".gradle", "coverage", ".turbo", ".cache"}
@@ -38,7 +39,7 @@ _file_locks: dict[str, asyncio.Lock] = {}
 
 
 def file_lock(p: Path) -> asyncio.Lock:
-    return _file_locks.setdefault(str(p), asyncio.Lock())
+    return _file_locks.setdefault(lock_key(p), asyncio.Lock())
 
 
 class ToolError(Exception):
@@ -85,7 +86,7 @@ def bound_output(text: str, limit: int) -> tuple[str, Optional[str]]:
         return text, None
     SPILL_DIR.mkdir(parents=True, exist_ok=True)
     spill = SPILL_DIR / f"tool_{uuid.uuid4().hex[:12]}.txt"
-    spill.write_text(text, encoding="utf-8")
+    write_text(spill, text)
     head = text[: int(limit * 0.6)]
     tail = text[-int(limit * 0.3):]
     total_lines = text.count("\n") + 1
@@ -110,9 +111,9 @@ def resolve(ctx: ToolContext, raw: str, *, for_read: bool = False) -> Path:
 
 def rel(ctx: ToolContext, p: Path) -> str:
     try:
-        return str(p.resolve().relative_to(ctx.directory.resolve())) or "."
+        return posix(p.resolve().relative_to(ctx.directory.resolve())) or "."
     except ValueError:
-        return str(p)
+        return posix(p)
 
 
 def _walk(root: Path):
@@ -189,7 +190,7 @@ async def t_read(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult(f"{rel(ctx, p)} is a directory:\n" + "\n".join(entries), rel(ctx, p))
     if not _is_text(p):
         raise ToolError(f"{rel(ctx, p)} looks binary")
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = read_text(p).splitlines()
     offset = max(0, int(args.get("offset") or 1) - 1)
     limit = int(args.get("limit") or MAX_READ_LINES)
     chunk = lines[offset: offset + limit]
@@ -220,7 +221,7 @@ async def t_glob(ctx: ToolContext, args: dict) -> ToolResult:
     root = resolve(ctx, args.get("path") or ".")
     matches = []
     for f in _walk(root):
-        r = str(f.relative_to(root))
+        r = posix(f.relative_to(root))
         if fnmatch.fnmatch(r, pattern) or fnmatch.fnmatch(f.name, pattern) or Path(r).match(pattern):
             matches.append((f.stat().st_mtime if f.exists() else 0, rel(ctx, f)))
         if len(matches) >= 500:
@@ -246,7 +247,7 @@ async def t_grep(ctx: ToolContext, args: dict) -> ToolResult:
         if not _is_text(f):
             continue
         try:
-            for n, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            for n, line in enumerate(read_text(f).splitlines(), 1):
                 if rx.search(line):
                     hits.append(f"{rel(ctx, f)}:{n}: {line.strip()[:300]}")
                     if len(hits) >= 200:
@@ -278,10 +279,12 @@ async def t_write(ctx: ToolContext, args: dict) -> ToolResult:
         raise ToolError("content is required")
     async with file_lock(p):
         _check_fresh(ctx, p)
-        before = p.read_text(encoding="utf-8", errors="replace") if p.exists() else None
+        before = read_text(p) if p.exists() else None
+        if before and "\r\n" in before and "\r\n" not in content:
+            content = content.replace("\n", "\r\n")  # keep the file's CRLF style (Windows files)
         _record_change(ctx, p, before)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        write_text(p, content)
         _mark_read(ctx, p)
     diff = make_diff(rel(ctx, p), before or "", content)
     verb = "Updated" if before is not None else "Created"
@@ -295,13 +298,13 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
             if len(edits) == 1 and not first.get("old_string"):
                 p.parent.mkdir(parents=True, exist_ok=True)
                 _record_change(ctx, p, None)
-                p.write_text(first.get("new_string") or "", encoding="utf-8")
+                write_text(p, first.get("new_string") or "")
                 _mark_read(ctx, p)
                 diff = make_diff(rel(ctx, p), "", first.get("new_string") or "")
                 return ToolResult(f"Created {rel(ctx, p)}", rel(ctx, p), {"diff": diff, **_diff_stats(diff)})
             raise ToolError(f"File not found: {rel(ctx, p)}. Use write to create it.")
         _check_fresh(ctx, p)
-        before = p.read_text(encoding="utf-8", errors="replace")
+        before = read_text(p)
         after = before
         strategies = []
         for i, e in enumerate(edits, 1):
@@ -316,7 +319,7 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
                 raise ToolError(f"{prefix}{err} No change was written.") from err
             strategies.append(strategy)
         _record_change(ctx, p, before)
-        p.write_text(after, encoding="utf-8")
+        write_text(p, after)
         _mark_read(ctx, p)
     diff = make_diff(rel(ctx, p), before, after)
     loose = [s for s in strategies if s != "exact"]
@@ -359,12 +362,12 @@ async def t_apply_patch(ctx: ToolContext, args: dict) -> ToolResult:
             if not p.exists():
                 raise ToolError(f"Delete File: {op.path} does not exist.")
             _check_fresh(ctx, p)
-            planned.append(("delete", p, None, p.read_text(encoding="utf-8", errors="replace"), None))
+            planned.append(("delete", p, None, read_text(p), None))
         else:
             if not p.exists():
                 raise ToolError(f"Update File: {op.path} does not exist.")
             _check_fresh(ctx, p)
-            before = p.read_text(encoding="utf-8", errors="replace")
+            before = read_text(p)
             try:
                 after = editing.apply_update(before, op.lines or [])
             except editing.EditError as e:
@@ -379,7 +382,7 @@ async def t_apply_patch(ctx: ToolContext, args: dict) -> ToolResult:
             if kind == "add":
                 _record_change(ctx, p, None)
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(after or "", encoding="utf-8")
+                write_text(p, after or "")
                 _mark_read(ctx, p)
                 diffs.append(make_diff(rel(ctx, p), "", after or ""))
                 summary.append(f"A {rel(ctx, p)}")
@@ -392,10 +395,10 @@ async def t_apply_patch(ctx: ToolContext, args: dict) -> ToolResult:
                 _record_change(ctx, p, before)
                 target = dest or p
                 if dest:
-                    _record_change(ctx, dest, dest.read_text(encoding="utf-8", errors="replace") if dest.exists() else None)
+                    _record_change(ctx, dest, read_text(dest) if dest.exists() else None)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     p.unlink()
-                target.write_text(after or "", encoding="utf-8")
+                write_text(target, after or "")
                 _mark_read(ctx, target)
                 diffs.append(make_diff(rel(ctx, target), before or "", after or ""))
                 summary.append(f"M {rel(ctx, p)}" + (f" -> {rel(ctx, dest)}" if dest else ""))
@@ -411,39 +414,12 @@ async def t_bash(ctx: ToolContext, args: dict) -> ToolResult:
     if not command.strip():
         raise ToolError("command is required")
     timeout = min(1800, max(1, int(args.get("timeout") or 120)))
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(ctx.directory),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        stdin=asyncio.subprocess.DEVNULL,
-        env={**os.environ, "CI": "1", "GIT_PAGER": "cat", "PAGER": "cat", "NO_COLOR": "1", "FORCE_COLOR": "0"},
-        start_new_session=True,
-    )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        code = proc.returncode
-        text = out.decode("utf-8", "replace")
-    except asyncio.TimeoutError:
-        _kill(proc)
-        await proc.wait()
-        code = -1
-        text = f"Command timed out after {timeout}s. For servers or watchers, run them in the background (cmd > log 2>&1 &)."
-    except asyncio.CancelledError:
-        _kill(proc)
-        raise
-    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).rstrip()  # strip ANSI codes: fewer tokens
+    code, text, timed_out = await run_command(command, str(ctx.directory), timeout, shell=load_config().get("shell", "auto"))
+    if timed_out:
+        text += (f"\nCommand timed out after {timeout}s. For servers or watchers, run them in the background "
+                 "(cmd > log 2>&1 &).")
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r\n", "\n").rstrip()  # fewer tokens
     return ToolResult(f"{text or '(no output)'}\n\n[exit code {code}]", command[:80], {"exitCode": code})
-
-
-def _kill(proc) -> None:
-    try:
-        os.killpg(proc.pid, 9)
-    except (ProcessLookupError, PermissionError, AttributeError, OSError):
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +472,7 @@ async def t_webfetch(ctx: ToolContext, args: dict) -> ToolResult:
         raise ToolError("url must start with http:// or https://")
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            res = await client.get(url, headers={"User-Agent": "DOINg.AI-Orchestrator/1.0"})
+            res = await client.get(url, headers={"User-Agent": "DOINg.AI-SuperCode/1.0"})
     except httpx.HTTPError as e:
         raise ToolError(f"Fetch failed: {e}") from e
     ctype = res.headers.get("content-type", "")

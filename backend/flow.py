@@ -28,9 +28,10 @@ from typing import Optional
 
 from . import journal, llm, permissions, planner, prompts, repomap
 from .agent import AgentSpec, execute_tool, make_context, run_agent
-from .config import EFFORT_MAX_STEPS, load_config, orchestrator_model, tier_effort, tier_model
+from .config import EFFORT_MAX_STEPS, auto_mode, load_config, orchestrator_model, tier_effort, tier_model
 from .session import MessageSink, Session, new_id, now_ms
 from .snapshot import Snapshots
+from .osutil import read_text, run_command, write_text
 from .tools import EDIT_TOOLS, IGNORED_DIRS, READ_ONLY, make_diff
 
 WORKER_TOOLS = READ_ONLY + EDIT_TOOLS + ["bash", "webfetch", "notes", "step"]
@@ -81,7 +82,7 @@ def changes_diff(directory: str, changes: dict[str, Optional[str]], limit: int =
     chunks = []
     for path, before in changes.items():
         p = Path(directory) / path
-        after = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        after = read_text(p) if p.exists() else ""
         d = make_diff(path, before or "", after)
         chunks.append(d or f"(no net change in {path})\n")
     text = "".join(chunks)
@@ -191,7 +192,8 @@ async def run_worker(
 
     spec = AgentSpec(
         name=run["type"],
-        system=prompts.system(session.directory, cfg["llm"].get("systemPrompt", ""), prompts.worker(tier, effort, max_steps)),
+        system=prompts.system(session.directory, cfg["llm"].get("systemPrompt", ""), prompts.worker(tier, effort, max_steps),
+                              auto=auto_mode(cfg, session.data)),
         tools=WORKER_TOOLS if notes_fn else [t for t in WORKER_TOOLS if t != "notes"],
         model=model, max_steps=max_steps, on_usage=on_usage, on_tool=on_tool, pinned=1,
     )
@@ -271,7 +273,8 @@ class FlowEngine:
 
         return AgentSpec(
             name="savvy-orchestrator",
-            system=prompts.system(self.session.directory, cfg["llm"].get("systemPrompt", ""), role),
+            system=prompts.system(self.session.directory, cfg["llm"].get("systemPrompt", ""), role,
+                                  auto=auto_mode(cfg, self.session.data)),
             tools=tools, model=orchestrator_model(cfg), max_steps=steps, on_usage=on_usage, pinned=1,
         )
 
@@ -377,6 +380,19 @@ class FlowEngine:
         self._hide_last_text(out.text)
 
         questions = [str(q) for q in (plan.get("questions") or []) if str(q).strip()]
+        auto = auto_mode(cfg, self.session.data)
+        if questions and auto:
+            self._auto_rounds = getattr(self, "_auto_rounds", 0) + 1
+            journal.log(self.session, "question", agent="savvy-orchestrator", questions=questions, auto=True)
+            if self._auto_rounds <= 2:
+                self.notice("Auto mode: the orchestrator answers its own questions with stated assumptions.")
+                self.plan_history.append({"role": "user", "content": (
+                    "AUTO MODE: no user is available to answer. Answer your own questions with the most reasonable "
+                    "assumptions, list those assumptions in the summary, and return the complete plan JSON with an "
+                    "empty questions list.\nYour questions were:\n" + "\n".join(f"- {q}" for q in questions))})
+                await self.plan()
+                return
+            questions = []  # still asking: proceed with what was planned
         modules = planner.clean_modules(plan.get("modules") or [])
         hierarchical = bool(cfg["flow"].get("hierarchical", True))
         mode = "modular" if modules and hierarchical else "simple"
@@ -418,11 +434,16 @@ class FlowEngine:
             "tasks": [{k: t.get(k) for k in ("n", "title", "tier", "size", "complexity", "files", "after", "module",
                                              "wave", "priority", "brief", "verify", "verifyCommand", "merged")} for t in tasks],
         }])
+        if not tasks and auto:
+            self.sink.add_message("assistant", "savvy-orchestrator", parts=[{"type": "error", "text": "Auto mode: the orchestrator produced no task. Rephrase the request or use a stronger orchestrator model."}])
+            self.flow.update(isFinished=True, phase="close", endedAt=now_ms(), failed=True)
+            self.emit()
+            return
         if questions or not tasks:
             self.flow["awaiting"] = "answers"
             self.emit()
             return
-        if cfg["flow"].get("requirePlanApproval", True) and not cfg["permissions"].get("autonomous"):
+        if cfg["flow"].get("requirePlanApproval", True) and not auto:
             self.flow["awaiting"] = "approval"
             self.emit()
             return
@@ -865,17 +886,43 @@ class FlowEngine:
         flow.update(isFinished=True, endedAt=now_ms(), running=0, executing=False)
         journal.log(self.session, "flow_end", done=flow["done"], total=flow["total"], tokens=flow.get("tokens", 0))
         self.emit()
+        await self._auto_pull_request()
         if self.cfg()["flow"].get("writeReport", True):
             try:
                 data = {**self.session.data, "_journal": journal.read(self.session.id, 400,
                         {"phase", "task", "verdict", "verify", "commit", "plan", "fix", "split", "error", "compaction", "loop"})}
                 docs = Path(self.session.directory) / "docs"
                 docs.mkdir(parents=True, exist_ok=True)
-                (docs / "FLOW_REPORT.md").write_text(journal.report(data), encoding="utf-8")
+                write_text(docs / "FLOW_REPORT.md", journal.report(data))
             except OSError:
                 pass
 
     # -- side effects -----------------------------------------------------
+    async def _auto_pull_request(self) -> None:
+        """Bitbucket PR when the flow ends (Settings > Bitbucket > open a PR after each flow)."""
+        cfg = self.cfg()["bitbucket"]
+        if not cfg.get("autoPrOnFlow") or not cfg.get("token") or not self.flow["done"]:
+            return
+        from . import bitbucket
+
+        try:
+            st = await bitbucket.status(self.session.directory, cfg.get("remote") or "origin")
+            _, stat = await bitbucket.git(self.session.directory, "diff", "--stat", "HEAD") if st.get("hasCommits") else (0, "")
+            draft = bitbucket.draft_description({**self.session.data}, stat)
+            pr = await bitbucket.create_pull_request(self.session.directory, cfg, title=draft["title"],
+                                                     description=draft["description"])
+        except Exception as e:  # noqa: BLE001 - reported, never breaks the flow
+            self.sink.add_message("assistant", "savvy-orchestrator", parts=[{"type": "error", "text": f"Automatic pull request failed: {e}"}])
+            journal.log(self.session, "error", error=f"auto PR: {e}")
+            return
+        entry = {**pr, "title": draft["title"], "createdAt": now_ms()}
+        self.session.data.setdefault("pullRequests", []).append(entry)
+        self.flow["pullRequest"] = pr["url"]
+        journal.log(self.session, "pr", url=pr["url"], branch=pr["branch"], target=pr["target"], steps=pr["steps"], auto=True)
+        self.session.emit("pr.created", {"pr": entry})
+        self.notice(f"Pull request opened: {pr['url']}")
+        self.emit()
+
     def _write_docs(self) -> None:
         flow = self.flow
         if not (flow.get("greenfield") or flow.get("mode") == "modular"):
@@ -887,7 +934,7 @@ class FlowEngine:
             if flow.get("spec"):
                 spec_file = docs / "SPEC.md"
                 if not spec_file.exists():
-                    spec_file.write_text(flow["spec"].rstrip() + "\n", encoding="utf-8")
+                    write_text(spec_file, flow["spec"].rstrip() + "\n")
             lines = [f"# PLAN: {flow['title']}", "", flow["summary"], ""]
             if flow.get("modules"):
                 lines += ["## Modules", ""]
@@ -905,7 +952,7 @@ class FlowEngine:
                 lines.append(f"  {t['brief'].replace(chr(10), ' ')[:600]}")
                 if t.get("verifyCommand"):
                     lines.append(f"  Verify: `{t['verifyCommand']}`")
-            (docs / "PLAN.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            write_text(docs / "PLAN.md", "\n".join(lines) + "\n")
         except OSError:
             pass
 
@@ -914,13 +961,11 @@ class FlowEngine:
             return
         root = Path(self.session.directory)
         message = f"savvy-flow: task {t['n']} - {t['title']}\n\nFlow: {self.flow['id']}\nTier: {t['tier']}\nRound: {t['round'] + 1}"
-        script = "git add -A && git commit -q -F -"
         if not (root / ".git").exists():
-            script = "git init -q && " + script
-        proc = await asyncio.create_subprocess_shell(script, cwd=str(root), stdin=asyncio.subprocess.PIPE,
-                                                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await proc.communicate(message.encode())
-        if proc.returncode == 0:
+            await run_command("git init -q", str(root), 60)
+        await run_command("git add -A", str(root), 120)
+        code, _out, _ = await run_command("git commit -q -F -", str(root), 120, stdin=message.encode("utf-8"))
+        if code == 0:
             journal.log(self.session, "commit", n=t["n"], message=message.splitlines()[0])
 
 

@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .osutil import atomic_write
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("ORCH_DATA_DIR", ROOT_DIR / "data"))
 CONFIG_FILE = DATA_DIR / "config.json"
@@ -37,6 +39,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "contextWindow": 16384,
         "temperature": 0.2,
         "timeout": 600,
+        # Language of the agents' answers (the app UI is English).
+        "responseLanguage": "English",
     },
     # Same ladder as savvy-flow; an empty model means "use llm.model".
     "tiers": {
@@ -48,6 +52,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "orchestratorModel": "",
     "workspace": str(Path.cwd()),
+    # Where "New project" creates folders by default, and the folders opened recently.
+    "projectsRoot": str(Path.home() / "SuperCodeProjects"),
+    "recentProjects": [],
+    # Shell for the bash tool: auto (bash on macOS/Linux; Git Bash on Windows, else PowerShell),
+    # bash, powershell, cmd, or the path of a shell executable.
+    "shell": "auto",
+    # Auto mode: no human in the loop. Plans are approved, permissions granted (deny rules still
+    # apply), questions answered by the agents themselves with stated assumptions.
+    "autoMode": False,
+    # Pull requests to Bitbucket (Server / Data Center or Cloud).
+    "bitbucket": {
+        "kind": "server",               # server (Data Center, self-hosted) | cloud (bitbucket.org)
+        "baseUrl": "",                  # https://bitbucket.company.com (server); ignored for cloud
+        "project": "",                  # server: project key; cloud: workspace. Empty = from the git remote
+        "repo": "",                     # repository slug. Empty = from the git remote
+        "username": "",                 # server: user slug (basic auth); cloud: Bitbucket username / email
+        "token": "",                    # server: HTTP access token; cloud: app password / API token
+        "targetBranch": "",             # empty = the repository default branch
+        "branchPrefix": "supercode/",
+        "reviewers": [],                # server: user slugs; cloud: account ids / uuids
+        "remote": "origin",
+        "autoPrOnFlow": False,          # open a PR automatically when a savvy-flow finishes
+        "verifySsl": True,
+    },
     "permissions": {
         "edit": "allow",
         "bash": "ask",
@@ -68,6 +96,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
             {"pattern": "git diff*", "action": "allow"},
             {"pattern": "git log*", "action": "allow"},
             {"pattern": "git show*", "action": "allow"},
+            {"pattern": "dir*", "action": "allow"},
+            {"pattern": "type *", "action": "allow"},
+            {"pattern": "where *", "action": "allow"},
+            {"pattern": "Get-ChildItem*", "action": "allow"},
+            {"pattern": "Get-Content*", "action": "allow"},
+            {"pattern": "rd /s*", "action": "deny"},
+            {"pattern": "rmdir /s*", "action": "deny"},
+            {"pattern": "del /s*", "action": "deny"},
+            {"pattern": "format *", "action": "deny"},
+            {"pattern": "Remove-Item*-Recurse*", "action": "deny"},
+            {"pattern": "Stop-Computer*", "action": "deny"},
             {"pattern": "sudo *", "action": "deny"},
             {"pattern": "rm -rf /*", "action": "deny"},
             {"pattern": "rm -rf ~*", "action": "deny"},
@@ -78,8 +117,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             {"pattern": "mkfs*", "action": "deny"},
             {"pattern": "dd if=*", "action": "deny"},
         ],
-        # Autonomous: every "ask" becomes "allow" (deny rules still apply). For long unattended runs.
-        "autonomous": False,
     },
     "flow": {
         "requirePlanApproval": True,
@@ -120,7 +157,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "goalMaxContinuations": 8,
     },
     "nexusDbPath": "",
-    "language": "auto",
 }
 
 _lock = threading.Lock()
@@ -137,6 +173,16 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _sanitize(cfg: dict) -> dict:
+    # Migration: permissions.autonomous (v2) -> autoMode.
+    if cfg["permissions"].pop("autonomous", False):
+        cfg["autoMode"] = True
+    cfg.pop("language", None)
+    bb = cfg["bitbucket"]
+    if bb.get("kind") not in ("server", "cloud"):
+        bb["kind"] = "server"
+    if not isinstance(bb.get("reviewers"), list):
+        bb["reviewers"] = [r.strip() for r in str(bb.get("reviewers") or "").split(",") if r.strip()]
+    cfg["recentProjects"] = [str(p) for p in (cfg.get("recentProjects") or []) if str(p).strip()][:15]
     llm = cfg["llm"]
     if llm.get("provider") not in PROVIDERS:
         llm["provider"] = "ollama"
@@ -182,9 +228,7 @@ def save_config(update: dict) -> dict:
     cfg = _sanitize(_deep_merge(load_config(), update or {}))
     with _lock:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(CONFIG_FILE)
+        atomic_write(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
     return cfg
 
 
@@ -198,6 +242,39 @@ def tier_effort(cfg: dict, tier: str) -> str:
 
 def orchestrator_model(cfg: dict) -> str:
     return cfg.get("orchestratorModel") or cfg["llm"]["model"]
+
+
+SECRET = "********"
+SECRET_PATHS = (("llm", "apiKey"), ("bitbucket", "token"))
+
+
+def public_config(cfg: dict) -> dict:
+    """The config sent to the browser: secrets masked."""
+    out = copy.deepcopy(cfg)
+    for section, key in SECRET_PATHS:
+        if out.get(section, {}).get(key):
+            out[section][key] = SECRET
+    return out
+
+
+def strip_masked(update: dict) -> dict:
+    """A save from the browser keeps stored secrets when it sends the mask back."""
+    for section, key in SECRET_PATHS:
+        if isinstance(update.get(section), dict) and update[section].get(key) == SECRET:
+            update[section].pop(key)
+    return update
+
+
+def remember_project(directory: str) -> None:
+    cfg = load_config()
+    recent = [directory] + [p for p in cfg.get("recentProjects", []) if p != directory]
+    save_config({"recentProjects": recent[:15]})
+
+
+def auto_mode(cfg: dict, session_data: dict | None = None) -> bool:
+    if session_data is not None and session_data.get("autoMode") is not None:
+        return bool(session_data["autoMode"])
+    return bool(cfg.get("autoMode"))
 
 
 # --------------------------------------------------------------------------

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, Menu, PanelLeft, PanelRight, X } from 'lucide-react';
 import { api } from './api';
 import { applyEvent } from './sessionReducer';
-import { I18nContext, STRINGS, detectLang } from './i18n';
+import { I18nContext, STRINGS } from './i18n';
 import type { AgentMode, AppConfig, JournalEntry, ServerEvent, Session, SessionSummary } from './types';
 import { agentColor, cx, fmtTokens } from './util';
 import { clearAttention, notify, requestNotifyPermission } from './notify';
@@ -10,6 +10,7 @@ import { CommandPalette, type PaletteItem } from './components/CommandPalette';
 import { COMMANDS, Composer } from './components/Composer';
 import { Markdown } from './components/Markdown';
 import { PermissionBar } from './components/PermissionBar';
+import { ProjectDialog } from './components/ProjectDialog';
 import { ProgressBar } from './components/ProgressBar';
 import { QuestionBar } from './components/QuestionBar';
 import { SettingsModal } from './components/SettingsModal';
@@ -36,6 +37,7 @@ export default function App() {
   const [focusRunId, setFocusRunId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [projectOpen, setProjectOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [help, setHelp] = useState(false);
@@ -52,8 +54,8 @@ export default function App() {
   const stick = useRef(true);
   const wasBusy = useRef(false);
 
-  const lang = detectLang(config?.language);
-  const t = STRINGS[lang];
+  const lang = 'en';
+  const t = STRINGS.en;
   const tRef = useRef(t);
   tRef.current = t;
 
@@ -220,6 +222,20 @@ export default function App() {
     setStuck(true);
   };
 
+  const startProject = async (directory: string, auto: boolean) => {
+    try {
+      const s = await api.createSession(agent, directory, auto);
+      setProjectOpen(false);
+      setSessions((list) => [s, ...list]);
+      setSession(s);
+      setCurrentId(s.id);
+      setNavOpen(false);
+      api.config().then(setConfig).catch(() => {});
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
   const newSession = async (mode: AgentMode = agent): Promise<Session | null> => {
     try {
       const s = await api.createSession(mode);
@@ -305,15 +321,20 @@ export default function App() {
     }
   };
 
+  const autoOn = session ? (session.autoMode ?? Boolean(config?.autoMode)) : Boolean(config?.autoMode);
   const toggleAuto = () => {
     if (!currentId || !session) return;
-    const value = !session.autonomous;
-    api.patchSession(currentId, { autonomous: value }).then(() => setSession((s) => (s ? { ...s, autonomous: value } : s))).catch((e) => setError(e.message));
+    const value = !autoOn;
+    api.patchSession(currentId, { autoMode: value }).then(() => setSession((s) => (s ? { ...s, autoMode: value } : s))).catch((e) => setError(e.message));
   };
 
   const onCommand = async (name: string, arg?: string) => {
     setError(null);
-    if (name === 'new') newSession();
+    if (name === 'new') setProjectOpen(true);
+    else if (name === 'pr') {
+      setSideTab('git');
+      setPanelOpen(true);
+    }
     else if (name === 'build' || name === 'plan') changeAgent(name);
     else if (name === 'flow') arg ? send(`/flow ${arg}`, 'flow') : changeAgent('flow');
     else if (name === 'agents') {
@@ -374,7 +395,7 @@ export default function App() {
       if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen((o) => !o); }
       else if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); setNavCollapsed((c) => !c); }
       else if (mod && e.key === '.') { e.preventDefault(); setPanelOpen((o) => !o); }
-      else if (e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); newSession(); }
+      else if (e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); setProjectOpen(true); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -386,8 +407,8 @@ export default function App() {
     }));
     items.push({ id: 'cmd-flow', group: 'cmd', label: '/flow …', hint: t.cmdFlow, run: () => setInject({ text: '/flow ', nonce: Date.now() }) });
     items.push({ id: 'cmd-goal', group: 'cmd', label: '/goal …', hint: t.cmdGoal, run: () => setInject({ text: '/goal ', nonce: Date.now() }) });
-    (['agents', 'plan', 'files', 'trace'] as SideTab[]).forEach((k) => items.push({
-      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, trace: t.tabTrace }[k],
+    (['agents', 'plan', 'files', 'git', 'trace'] as SideTab[]).forEach((k) => items.push({
+      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, git: t.tabGit, trace: t.tabTrace }[k],
       run: () => { setSideTab(k); setPanelOpen(true); },
     }));
     sessions.forEach((s) => items.push({ id: `ses-${s.id}`, group: 'session', label: s.title, hint: s.directory, run: () => setCurrentId(s.id) }));
@@ -415,7 +436,7 @@ export default function App() {
             sessions={sessions}
             currentId={currentId}
             onSelect={(id) => { setCurrentId(id); setNavOpen(false); }}
-            onNew={() => newSession()}
+            onNew={() => setProjectOpen(true)}
             onDelete={deleteSession}
             onSettings={() => setSettingsOpen(true)}
             config={config}
@@ -459,7 +480,8 @@ export default function App() {
   ██║  ██║██║   ██║██║██╔██╗ ██║██║  ███╗
   ██║  ██║██║   ██║██║██║╚██╗██║██║   ██║
   ██████╔╝╚██████╔╝██║██║ ╚████║╚██████╔╝
-  ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ .AI`}</pre>
+  ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝ ╚═════╝ .AI
+                        S U P E R C O D E`}</pre>
                     <h1 className="text-base font-bold">{t.emptyTitle}</h1>
                     <ul className="mx-auto max-w-lg space-y-1.5 text-left text-[12px] text-muted">
                       <li><span style={{ color: 'var(--build)' }}>▸</span> {t.emptyHint1}</li>
@@ -556,7 +578,7 @@ export default function App() {
               totalTokens={totalTokens}
               compactions={session?.compactions || 0}
               goal={session?.goal}
-              autonomous={Boolean(session?.autonomous || config?.permissions.autonomous)}
+              autonomous={autoOn}
               onToggleAuto={toggleAuto}
               onClearGoal={() => currentId && api.goal(currentId, null).then(() => setSession((s) => (s ? { ...s, goal: null } : s)))}
             />
@@ -579,9 +601,12 @@ export default function App() {
               busy={busy}
               filesVersion={filesVersion}
               liveJournal={liveJournal}
+              onOpenSettings={() => setSettingsOpen(true)}
             />
           </div>
         )}
+
+        {projectOpen && <ProjectDialog defaultAuto={Boolean(config?.autoMode)} onClose={() => setProjectOpen(false)} onStart={startProject} />}
 
         {paletteOpen && <CommandPalette items={paletteItems} onClose={() => setPaletteOpen(false)} />}
 

@@ -4,6 +4,8 @@ server.py — entry point: runs uvicorn on backend.main:app (:4001), --workspace
 requirements.txt — Python deps (FastAPI, uvicorn, httpx, pytest)
 install.bat / install.sh — venv + pip + npm install + frontend build
 start.bat / start.sh / start-dev.bat — launch prod / dev
+.github/workflows/ci.yml — tests + build + smoke test on Windows, Ubuntu, macOS
+.gitattributes — CRLF for .bat, LF for .sh
 pytest.ini — test config (asyncio auto mode)
 
 backend/ — Python API
@@ -18,6 +20,8 @@ backend/planner.py — plan decomposition: modules, deps, tier floor, merge/spli
 backend/repomap.py — ranked file/signature map (ast for Python, regex for JS/TS/Go/Rust/Java...)
 backend/snapshot.py — shadow git snapshots: track, changed, diff, restore (undo, revert file)
 backend/journal.py — JSONL journal per session + Markdown report
+backend/osutil.py — cross-platform: exact-newline file IO, posix paths, shell detection (Git Bash / PowerShell), process trees, atomic writes
+backend/bitbucket.py — git status, branch/commit/push, Bitbucket Server + Cloud pull requests, PR description draft
 backend/tools.py — tool implementations + registry (read, list, glob, grep, repomap, write, edit, multiedit, apply_patch, bash, webfetch, todo, question, notes, step, task)
 backend/flow.py — savvy-flow engine: architect + per-module planning, DAG scheduler, auto-verify/fix, review, gates, integration, close; run_worker
 backend/prompts.py — system prompts: base, build, plan, orchestrator phases, workers per tier
@@ -29,7 +33,7 @@ frontend/src/App.tsx — layout, session loading + SSE, commands, panels
 frontend/src/api.ts — REST + EventSource client
 frontend/src/types.ts — mirrors backend JSON shapes and events
 frontend/src/sessionReducer.ts — applies SSE events to the open session
-frontend/src/i18n.ts — fr / en strings
+frontend/src/i18n.ts — UI strings (English only)
 frontend/src/util.ts — formatting helpers, tier list, agent colors
 frontend/src/index.css — theme variables, markdown, animations (tier crew, shimmer)
 frontend/src/components/Sidebar.tsx — sessions list, LLM status, settings entry
@@ -45,6 +49,8 @@ frontend/src/components/FilesPanel.tsx — files changed since session start, di
 frontend/src/components/TracePanel.tsx — live journal with filters, report export
 frontend/src/components/CommandPalette.tsx — Ctrl+K palette
 frontend/src/components/QuestionBar.tsx — answers to the question tool
+frontend/src/components/ProjectDialog.tsx — new project / open folder with a folder browser (drives, recent)
+frontend/src/components/GitPanel.tsx — git status and Bitbucket pull request form
 frontend/src/components/TierIcon.tsx — tier crew icons + chips
 frontend/src/components/Composer.tsx — prompt, agent switch, / commands, @ files, queue, history, drafts, status bar
 frontend/src/notify.ts — desktop notifications + title badge

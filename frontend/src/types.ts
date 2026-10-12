@@ -206,7 +206,7 @@ export interface SessionSummary {
   busy: boolean;
   flowTitle?: string | null;
   goalActive?: boolean;
-  autonomous?: boolean;
+  autoMode?: boolean | null;
 }
 
 export interface Session extends SessionSummary {
@@ -220,7 +220,7 @@ export interface Session extends SessionSummary {
   contextTokens?: number;
   compactions?: number;
   goal?: Goal | null;
-  autonomous?: boolean;
+  pullRequests?: PullRequest[];
   baseSnapshot?: string | null;
   seq?: number;
 }
@@ -235,6 +235,7 @@ export interface LlmConfig {
   contextWindow: number;
   temperature: number;
   timeout: number;
+  responseLanguage: string;
 }
 
 export type Perm = 'allow' | 'ask' | 'deny';
@@ -249,7 +250,6 @@ export interface AppConfig {
     bash: Perm;
     webfetch: Perm;
     bashRules: { pattern: string; action: Perm }[];
-    autonomous: boolean;
   };
   flow: {
     requirePlanApproval: boolean;
@@ -275,7 +275,53 @@ export interface AppConfig {
   context: { toolOutputMaxChars: number; pruneAt: number; compactAt: number; keepRecentShare: number; repoMap: boolean; repoMapChars: number };
   agent: { maxRetries: number; retryBaseSeconds: number; doomLoopThreshold: number; requireReadBeforeEdit: boolean; goalMaxContinuations: number };
   nexusDbPath: string;
-  language: 'auto' | 'fr' | 'en';
+  projectsRoot: string;
+  recentProjects: string[];
+  shell: string;
+  autoMode: boolean;
+  bitbucket: BitbucketConfig;
+}
+
+export interface BitbucketConfig {
+  kind: 'server' | 'cloud';
+  baseUrl: string;
+  project: string;
+  repo: string;
+  username: string;
+  token: string;
+  targetBranch: string;
+  branchPrefix: string;
+  reviewers: string[];
+  remote: string;
+  autoPrOnFlow: boolean;
+  verifySsl: boolean;
+}
+
+export interface PullRequest { id: number; url: string; branch: string; target: string; steps: string[]; title: string; createdAt: number; existing?: boolean }
+
+export interface GitStatus {
+  isRepo: boolean;
+  branch?: string;
+  hasCommits?: boolean;
+  remoteUrl?: string;
+  remote?: { kind: string; project: string; repo: string; baseUrl: string } | null;
+  changes?: string[];
+  branches?: string[];
+  draft?: { title: string; description: string };
+  configured?: boolean;
+  target?: { kind?: string; project?: string; repo?: string; error?: string } | null;
+  pullRequests?: PullRequest[];
+}
+
+export interface FolderListing {
+  path: string;
+  parent: string | null;
+  dirs: { name: string; path: string; isProject: boolean }[];
+  roots: string[];
+  home: string;
+  projectsRoot: string;
+  recent: string[];
+  sep: string;
 }
 
 export type ServerEvent = { seq?: number } & (
@@ -295,4 +341,5 @@ export type ServerEvent = { seq?: number } & (
   | { type: 'question.asked'; question: Question }
   | { type: 'question.resolved'; question: Question }
   | { type: 'goal.updated'; goal: Goal | null }
-  | { type: 'journal'; entry: JournalEntry });
+  | { type: 'journal'; entry: JournalEntry }
+  | { type: 'pr.created'; pr: PullRequest });

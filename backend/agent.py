@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import compaction, journal, llm, permissions
-from .config import load_config
+from .config import auto_mode, load_config
 from .session import MessageSink, Session, new_id, now_ms
 from .tools import TOOLS, ToolContext, ToolError, _clip, bound_output
 
@@ -133,9 +133,18 @@ def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str
     elif value == "ask" and category in grants:
         value = "allow"
     forced_ask = spec.permissions.get(category) == "ask"
-    if value == "ask" and not forced_ask and (cfg.get("autonomous") or session.data.get("autonomous")):
+    if value == "ask" and not forced_ask and auto_mode(load_config(), session.data):
         value = "allow"
     return value
+
+
+AUTO_ANSWER = ("No user is available (auto mode). Choose the most reasonable option yourself, "
+               "state the assumption in one line, and continue.")
+
+
+async def auto_answer(session: Session, agent: str, questions: list[dict]) -> list[list[str]]:
+    journal.log(session, "question", agent=agent, questions=[q["question"] for q in questions], auto=True)
+    return [[AUTO_ANSWER] for _ in questions]
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +295,10 @@ async def run_agent(
     loop_threshold = max(2, int(agent_cfg.get("doomLoopThreshold") or 3))
     ctx.require_read = bool(agent_cfg.get("requireReadBeforeEdit", True))
     if "question" in spec.tools and ctx.ask is None:
-        ctx.ask = lambda qs: ask_questions(session, spec.name, sink.run_id, qs)
+        if auto_mode(full_cfg, session.data):
+            ctx.ask = lambda qs: auto_answer(session, spec.name, qs)
+        else:
+            ctx.ask = lambda qs: ask_questions(session, spec.name, sink.run_id, qs)
 
     steps = in_tok = out_tok = 0
     final_text = ""

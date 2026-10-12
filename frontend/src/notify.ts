@@ -1,6 +1,6 @@
 /* Desktop notifications + title badge for long unattended runs. */
 
-const BASE_TITLE = 'DOINg.AI Orchestrator';
+const BASE_TITLE = 'DOINg.AI SuperCode';
 let attention = 0;
 
 export function requestNotifyPermission(): void {
@@ -17,7 +17,7 @@ export function notify(title: string, body: string): void {
   document.title = `(${attention}) ${BASE_TITLE}`;
   try {
     if ('Notification' in window && Notification.permission === 'granted') {
-      const n = new Notification(title, { body: body.slice(0, 180), tag: 'doing-ai-orchestrator' });
+      const n = new Notification(title, { body: body.slice(0, 180), tag: 'doing-ai-supercode' });
       n.onclick = () => {
         window.focus();
         n.close();

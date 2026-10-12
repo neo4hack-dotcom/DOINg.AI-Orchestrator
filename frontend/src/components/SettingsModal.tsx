@@ -6,7 +6,7 @@ import { api } from '../api';
 import { TIERS, cx } from '../util';
 import { TierChip, TierIcon } from './TierIcon';
 
-type Tab = 'llm' | 'tiers' | 'workspace' | 'flow' | 'context' | 'agent';
+type Tab = 'llm' | 'tiers' | 'workspace' | 'bitbucket' | 'flow' | 'context' | 'agent';
 
 const TIER_DESC: Record<Tier, keyof Strings> = {
   fable: 'tierFable',
@@ -72,6 +72,17 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   const setCtx = (patch: Partial<AppConfig['context']>) => setCfg((c) => ({ ...c, context: { ...c.context, ...patch } }));
   const setAgent = (patch: Partial<AppConfig['agent']>) => setCfg((c) => ({ ...c, agent: { ...c.agent, ...patch } }));
   const setPerm = (patch: Partial<AppConfig['permissions']>) => setCfg((c) => ({ ...c, permissions: { ...c.permissions, ...patch } }));
+  const setBb = (patch: Partial<AppConfig['bitbucket']>) => setCfg((c) => ({ ...c, bitbucket: { ...c.bitbucket, ...patch } }));
+  const [bbTest, setBbTest] = useState<{ ok: boolean; message: string } | null>(null);
+  const runBbTest = async () => {
+    setBbTest(null);
+    try {
+      const r = await api.testBitbucket(cfg.bitbucket, cfg.workspace);
+      setBbTest({ ok: r.ok, message: r.ok ? `OK: ${r.kind} ${r.name}` : r.message || 'Failed' });
+    } catch (e: any) {
+      setBbTest({ ok: false, message: e.message });
+    }
+  };
   const setTier = (tier: Tier, patch: Partial<AppConfig['tiers'][Tier]>) =>
     setCfg((c) => ({ ...c, tiers: { ...c.tiers, [tier]: { ...c.tiers[tier], ...patch } } }));
 
@@ -118,7 +129,7 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   };
 
   const models = test?.models || [];
-  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['flow', t.tabFlow], ['context', t.tabContext], ['agent', t.tabAgentCfg]];
+  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['bitbucket', t.tabBitbucket], ['flow', t.tabFlow], ['context', t.tabContext], ['agent', t.tabAgentCfg]];
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -179,6 +190,9 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
                   </Field>
                 </div>
               </div>
+              <Field label={t.responseLanguage}>
+                <input className={inputCls} value={cfg.llm.responseLanguage} onChange={(e) => setLlm({ responseLanguage: e.target.value })} placeholder="English" />
+              </Field>
               <Field label={t.systemPrompt}>
                 <textarea className={`${inputCls} min-h-[64px]`} value={cfg.llm.systemPrompt} onChange={(e) => setLlm({ systemPrompt: e.target.value })} />
               </Field>
@@ -250,20 +264,60 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
                   </div>
                 </Field>
               ))}
-              <Toggle label={t.autonomous} hint={t.autonomousHint} checked={cfg.permissions.autonomous} onChange={(v) => setPerm({ autonomous: v })} />
+              <Toggle label={t.autoModeDefault} checked={cfg.autoMode} onChange={(v) => setCfg((c) => ({ ...c, autoMode: v }))} />
+              <Field label={t.projectsRoot}>
+                <input className={inputCls} value={cfg.projectsRoot} onChange={(e) => setCfg((c) => ({ ...c, projectsRoot: e.target.value }))} spellCheck={false} />
+              </Field>
+              <Field label={t.shell}>
+                <select className={inputCls} value={['auto', 'bash', 'powershell', 'cmd'].includes(cfg.shell) ? cfg.shell : 'auto'} onChange={(e) => setCfg((c) => ({ ...c, shell: e.target.value }))}>
+                  <option value="auto">{t.shellAuto}</option>
+                  <option value="bash">bash / Git Bash</option>
+                  <option value="powershell">PowerShell</option>
+                  <option value="cmd">cmd.exe</option>
+                </select>
+              </Field>
               <Field label={t.bashRules}>
                 <textarea className={`${inputCls} min-h-[140px] text-[12px]`} value={rulesText} onChange={(e) => setRulesText(e.target.value)} spellCheck={false} />
               </Field>
               <Field label={t.verifyCommands}>
                 <textarea className={`${inputCls} min-h-[64px] text-[12px]`} value={verifyText} onChange={(e) => setVerifyText(e.target.value)} placeholder="npm run build&#10;pytest -q" spellCheck={false} />
               </Field>
-              <Field label={t.language}>
-                <select className={inputCls} value={cfg.language} onChange={(e) => setCfg((c) => ({ ...c, language: e.target.value as AppConfig['language'] }))}>
-                  <option value="auto">auto</option>
-                  <option value="fr">Français</option>
-                  <option value="en">English</option>
+            </>
+          )}
+
+          {tab === 'bitbucket' && (
+            <>
+              <Field label={t.bbKind}>
+                <select className={inputCls} value={cfg.bitbucket.kind} onChange={(e) => setBb({ kind: e.target.value as 'server' | 'cloud' })}>
+                  <option value="server">{t.bbServer}</option>
+                  <option value="cloud">{t.bbCloud}</option>
                 </select>
               </Field>
+              {cfg.bitbucket.kind === 'server' && (
+                <Field label={t.bbBaseUrl} hint={t.bbBaseUrlHint}>
+                  <input className={inputCls} value={cfg.bitbucket.baseUrl} onChange={(e) => setBb({ baseUrl: e.target.value })} placeholder="https://bitbucket.company.com" />
+                </Field>
+              )}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field label={t.bbProject} hint={t.bbAutoHint}><input className={inputCls} value={cfg.bitbucket.project} onChange={(e) => setBb({ project: e.target.value })} /></Field>
+                <Field label={t.bbRepo} hint={t.bbAutoHint}><input className={inputCls} value={cfg.bitbucket.repo} onChange={(e) => setBb({ repo: e.target.value })} /></Field>
+                <Field label={t.bbUsername}><input className={inputCls} value={cfg.bitbucket.username} onChange={(e) => setBb({ username: e.target.value })} autoComplete="off" /></Field>
+                <Field label={t.bbToken}><input className={inputCls} type="password" value={cfg.bitbucket.token} onChange={(e) => setBb({ token: e.target.value })} autoComplete="off" /></Field>
+                <Field label={t.bbTarget}><input className={inputCls} value={cfg.bitbucket.targetBranch} onChange={(e) => setBb({ targetBranch: e.target.value })} placeholder="develop" /></Field>
+                <Field label={t.bbPrefix}><input className={inputCls} value={cfg.bitbucket.branchPrefix} onChange={(e) => setBb({ branchPrefix: e.target.value })} /></Field>
+                <Field label={t.bbRemote}><input className={inputCls} value={cfg.bitbucket.remote} onChange={(e) => setBb({ remote: e.target.value })} /></Field>
+                <Field label={t.bbReviewers}>
+                  <input className={inputCls} value={cfg.bitbucket.reviewers.join(', ')} onChange={(e) => setBb({ reviewers: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} />
+                </Field>
+              </div>
+              <Toggle label={t.bbAutoPr} checked={cfg.bitbucket.autoPrOnFlow} onChange={(v) => setBb({ autoPrOnFlow: v })} />
+              <Toggle label={t.bbVerifySsl} checked={cfg.bitbucket.verifySsl} onChange={(v) => setBb({ verifySsl: v })} />
+              <div className="space-y-2">
+                <button type="button" onClick={runBbTest} className="inline-flex items-center gap-1.5 rounded border border-line px-3 py-1.5 hover:border-accent/60">
+                  <PlugZap size={13} /> {t.bbTest}
+                </button>
+                {bbTest && <div className={cx('rounded border px-3 py-2 text-[12px]', bbTest.ok ? 'border-ok/40 text-ok' : 'border-err/40 text-err')}>{bbTest.message}</div>}
+              </div>
             </>
           )}
 

@@ -13,6 +13,7 @@ export const COMMANDS: { name: string; desc: keyof Strings; arg?: boolean }[] = 
   { name: 'new', desc: 'cmdNew' },
   { name: 'build', desc: 'cmdBuild' },
   { name: 'plan', desc: 'cmdPlan' },
+  { name: 'pr', desc: 'cmdPr' },
   { name: 'undo', desc: 'cmdUndo' },
   { name: 'compact', desc: 'cmdCompact' },
   { name: 'fork', desc: 'cmdFork' },

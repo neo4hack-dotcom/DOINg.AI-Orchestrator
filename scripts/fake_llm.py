@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 import uuid
 
 from fastapi import FastAPI, Request
@@ -40,7 +41,8 @@ def _assistant_turns(messages: list[dict]) -> int:
 
 
 GREETING_PY = 'def greet(name):\n    return f"Hello, {name}!"\n'
-CHECK_PY = "python3 -c \"import greeting; assert greeting.greet('x') == 'Hello, x!'\""
+PY = sys.executable.replace("\\", "/")  # Windows-safe inside bash/PowerShell/cmd quotes
+CHECK_PY = f"\"{PY}\" -c \"import greeting; assert greeting.greet('x') == 'Hello, x!'\""
 
 
 def _task(title, tier, size, complexity, files, after, brief, verify_cmd=""):

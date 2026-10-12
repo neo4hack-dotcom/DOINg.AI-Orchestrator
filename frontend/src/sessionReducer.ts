@@ -64,6 +64,8 @@ export function applyEvent(s: Session, e: ServerEvent): Session {
       return { ...s, pendingQuestions: [...(s.pendingQuestions || []).filter((q) => q.id !== e.question.id), e.question] };
     case 'question.resolved':
       return { ...s, pendingQuestions: (s.pendingQuestions || []).filter((q) => q.id !== e.question.id) };
+    case 'pr.created':
+      return { ...s, pullRequests: [...(s.pullRequests || []), e.pr] };
     case 'goal.updated':
       return { ...s, goal: e.goal };
     case 'status':

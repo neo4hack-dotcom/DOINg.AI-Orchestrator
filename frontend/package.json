@@ -1,9 +1,9 @@
 {
-  "name": "doing-ai-orchestrator",
+  "name": "doing-ai-supercode",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "DOINg.AI Orchestrator - OpenCode-style coding agent for local LLMs, with savvy-flow and savvy-progress",
+  "description": "DOINg.AI SuperCode - OpenCode-style coding agent for local LLMs, with savvy-flow and savvy-progress",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

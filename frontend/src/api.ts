@@ -1,4 +1,4 @@
-import type { AgentMode, AgentRun, AppConfig, ChangedFile, Goal, JournalEntry, ServerEvent, Session, SessionSummary } from './types';
+import type { AgentMode, AgentRun, AppConfig, BitbucketConfig, ChangedFile, FolderListing, GitStatus, Goal, JournalEntry, PullRequest, ServerEvent, Session, SessionSummary } from './types';
 
 async function req<T>(method: string, url: string, body?: unknown, text = false): Promise<T> {
   const res = await fetch(url, {
@@ -27,9 +27,17 @@ export const api = {
   importNexus: (path: string) => req<{ config: AppConfig; source: string }>('POST', '/api/config/import-nexus', { path }),
 
   sessions: () => req<SessionSummary[]>('GET', '/api/sessions'),
-  createSession: (agent: AgentMode, directory = '') => req<Session>('POST', '/api/sessions', { agent, directory }),
+  createSession: (agent: AgentMode, directory = '', autoMode: boolean | null = null) =>
+    req<Session>('POST', '/api/sessions', { agent, directory, autoMode }),
+  listFolder: (path = '') => req<FolderListing>('GET', `/api/fs/list?path=${encodeURIComponent(path)}`),
+  createProject: (parent: string, name: string, gitInit: boolean) => req<{ path: string }>('POST', '/api/projects', { parent, name, gitInit }),
+  git: (id: string) => req<GitStatus>('GET', `/api/sessions/${id}/git`),
+  createPr: (id: string, body: { title: string; description: string; branch: string; target: string; commitMessage: string }) =>
+    req<PullRequest>('POST', `/api/sessions/${id}/pr`, body),
+  testBitbucket: (bitbucket: Partial<BitbucketConfig>, directory = '') =>
+    req<{ ok: boolean; message?: string; name?: string; kind?: string }>('POST', '/api/bitbucket/test', { bitbucket, directory }),
   session: (id: string) => req<Session>('GET', `/api/sessions/${id}`),
-  patchSession: (id: string, patch: { title?: string; agent?: AgentMode; autonomous?: boolean }) => req<SessionSummary>('PATCH', `/api/sessions/${id}`, patch),
+  patchSession: (id: string, patch: { title?: string; agent?: AgentMode; autoMode?: boolean | null }) => req<SessionSummary>('PATCH', `/api/sessions/${id}`, patch),
   deleteSession: (id: string) => req<{ ok: boolean }>('DELETE', `/api/sessions/${id}`),
   send: (id: string, text: string, agent: AgentMode) => req<{ ok: boolean }>('POST', `/api/sessions/${id}/message`, { text, agent }),
   abort: (id: string) => req<{ ok: boolean }>('POST', `/api/sessions/${id}/abort`),

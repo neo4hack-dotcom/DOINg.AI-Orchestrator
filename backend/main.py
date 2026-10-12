@@ -10,17 +10,20 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import compaction, journal, llm, prompts
+from . import bitbucket, compaction, journal, llm, prompts
 from .agent import AgentSpec, _manage_context, make_context, run_agent
-from .config import CONFIG_FILE, ROOT_DIR, load_config, read_nexus_llm_config, save_config
+from .config import (CONFIG_FILE, ROOT_DIR, auto_mode, load_config, public_config, read_nexus_llm_config,
+                     remember_project, save_config, strip_masked)
 from .flow import FlowEngine, extract_json, resume_engine, run_worker
 from .session import MessageSink, Session, new_id, now_ms, store
+from .osutil import posix, read_text, run_command
 from .snapshot import Snapshots
 from .tools import IGNORED_DIRS, READ_ONLY
 
@@ -38,7 +41,7 @@ def first_run_nexus_import() -> None:
     except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
         return
     save_config({"llm": llm_cfg, "nexusDbPath": str(path)})
-    print(f"[orchestrator] LLM settings imported from NEXUS.AI: {path}")
+    print(f"[supercode] LLM settings imported from NEXUS.AI: {path}")
 
 
 def resume_interrupted_flows() -> list[str]:
@@ -74,7 +77,7 @@ async def lifespan(_app: FastAPI):
         s.save()
 
 
-app = FastAPI(title="DOINg.AI Orchestrator", lifespan=lifespan)
+app = FastAPI(title="DOINg.AI SuperCode", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -97,12 +100,13 @@ class NexusImport(BaseModel):
 class SessionCreate(BaseModel):
     agent: str = "build"
     directory: str = ""
+    autoMode: Optional[bool] = None
 
 
 class SessionPatch(BaseModel):
     title: Optional[str] = None
     agent: Optional[str] = None
-    autonomous: Optional[bool] = None
+    autoMode: Optional[bool] = None  # null = follow the global setting
 
 
 class MessageIn(BaseModel):
@@ -141,25 +145,25 @@ async def health() -> dict:
 
 @app.get("/api/config")
 async def get_config() -> dict:
-    return load_config()
+    return public_config(load_config())
 
 
 @app.put("/api/config")
 async def put_config(body: ConfigUpdate) -> dict:
-    data = body.model_dump()
+    data = strip_masked(body.model_dump())
     if "workspace" in data and data["workspace"]:
         p = Path(data["workspace"]).expanduser()
         if not p.is_dir():
             raise HTTPException(400, f"Workspace folder not found: {p}")
         data["workspace"] = str(p.resolve())
-    return save_config(data)
+    return public_config(save_config(data))
 
 
 @app.post("/api/config/test")
 async def test_config(body: TestRequest) -> dict:
     cfg = load_config()["llm"]
     if body.llm:
-        cfg = {**cfg, **body.llm}
+        cfg = {**cfg, **strip_masked({"llm": dict(body.llm)})["llm"]}
     return await llm.test_connection(cfg)
 
 
@@ -170,7 +174,7 @@ async def import_nexus(body: NexusImport) -> dict:
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
         raise HTTPException(400, str(e)) from e
     cfg = save_config({"llm": llm_cfg, "nexusDbPath": str(path)})
-    return {"config": cfg, "source": str(path)}
+    return {"config": public_config(cfg), "source": str(path)}
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +195,85 @@ async def list_sessions() -> list:
 
 @app.post("/api/sessions")
 async def create_session(body: SessionCreate) -> dict:
-    directory = body.directory or load_config()["workspace"]
-    if not Path(directory).expanduser().is_dir():
+    directory = str(Path(body.directory or load_config()["workspace"]).expanduser())
+    if not Path(directory).is_dir():
         raise HTTPException(400, f"Folder not found: {directory}")
+    directory = str(Path(directory).resolve())
     s = store.create(directory, body.agent if body.agent in AGENTS else "build")
+    if body.autoMode is not None:
+        s.data["autoMode"] = body.autoMode
+    remember_project(directory)
     return s.full()
+
+
+# ---------------------------------------------------------------------------
+# project locations: folder browser and "new project"
+
+INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _roots() -> list[str]:
+    if os.name == "nt":
+        import string
+        return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+    return ["/"]
+
+
+@app.get("/api/fs/list")
+async def fs_list(path: str = "", hidden: bool = False) -> dict:
+    """Sub-folders of ``path`` (default: the projects root, else home) for the folder picker."""
+    cfg = load_config()
+    if path:
+        target = Path(path).expanduser()
+    else:
+        root = Path(cfg.get("projectsRoot") or Path.home()).expanduser()
+        target = root if root.is_dir() else Path.home()
+    if not target.is_dir():
+        raise HTTPException(400, f"Folder not found: {target}")
+    target = target.resolve()
+    dirs = []
+    try:
+        for entry in sorted(os.scandir(target), key=lambda e: e.name.lower()):
+            try:
+                if entry.is_dir() and (hidden or not entry.name.startswith(".")) and entry.name not in IGNORED_DIRS:
+                    dirs.append({"name": entry.name, "path": str(Path(entry.path)),
+                                 "isProject": any((Path(entry.path) / m).exists() for m in (".git", "package.json", "pyproject.toml", "AGENTS.md"))})
+            except OSError:
+                continue
+    except PermissionError as e:
+        raise HTTPException(403, f"Cannot open {target}: {e}") from e
+    parent = target.parent if target.parent != target else None
+    return {"path": str(target), "parent": str(parent) if parent else None, "dirs": dirs[:500], "roots": _roots(),
+            "home": str(Path.home()), "projectsRoot": cfg.get("projectsRoot"), "recent": cfg.get("recentProjects", []),
+            "sep": os.sep}
+
+
+class ProjectCreate(BaseModel):
+    parent: str
+    name: str
+    gitInit: bool = True
+
+
+@app.post("/api/projects")
+async def create_project(body: ProjectCreate) -> dict:
+    name = body.name.strip()
+    if not name or INVALID_NAME.search(name) or name in (".", ".."):
+        raise HTTPException(400, "Invalid project name (avoid < > : \" / \\ | ? *)")
+    parent = Path(body.parent or load_config().get("projectsRoot") or Path.home()).expanduser()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(400, f"Cannot create {parent}: {e}") from e
+    target = (parent / name).resolve()
+    if target.exists() and any(target.iterdir()):
+        raise HTTPException(409, f"{target} already exists and is not empty")
+    target.mkdir(parents=True, exist_ok=True)
+    if body.gitInit:
+        code, out, _ = await run_command("git init -q", str(target), 60)
+        if code != 0:
+            raise HTTPException(500, f"git init failed: {out[:300]}")
+    remember_project(str(target))
+    return {"path": str(target)}
 
 
 @app.get("/api/sessions/{sid}")
@@ -210,9 +288,9 @@ async def patch_session(sid: str, body: SessionPatch) -> dict:
         s.data["title"] = body.title.strip()[:120] or s.data["title"]
     if body.agent in AGENTS:
         s.data["agent"] = body.agent
-    if body.autonomous is not None:
-        s.data["autonomous"] = bool(body.autonomous)
-        journal.log(s, "autonomous", value=s.data["autonomous"])
+    if "autoMode" in body.model_fields_set:
+        s.data["autoMode"] = body.autoMode
+        journal.log(s, "auto_mode", value=s.data["autoMode"])
     s.touch()
     s.emit("session.updated", {"session": s.summary()})
     return s.summary()
@@ -354,6 +432,83 @@ async def undo(sid: str) -> dict:
     return {"text": text, "files": touched}
 
 
+# ---------------------------------------------------------------------------
+# git + Bitbucket pull requests
+
+
+class PullRequestIn(BaseModel):
+    title: str
+    description: str = ""
+    branch: str = ""
+    target: str = ""
+    commitMessage: str = ""
+
+
+class BitbucketTest(BaseModel):
+    directory: str = ""
+    bitbucket: Optional[dict] = None
+
+
+async def _diffstat(directory: str, st: dict) -> str:
+    if not st.get("isRepo"):
+        return ""
+    if st.get("hasCommits"):
+        _, out = await bitbucket.git(directory, "diff", "--stat", "HEAD")
+    else:
+        out = ""
+    untracked = [l[3:] for l in st.get("changes", []) if l.startswith("??")]
+    if untracked:
+        out += ("\n" if out else "") + "\n".join(f" {u} (new)" for u in untracked[:50])
+    return out
+
+
+@app.get("/api/sessions/{sid}/git")
+async def git_status(sid: str) -> dict:
+    s = _get(sid)
+    cfg = load_config()["bitbucket"]
+    st = await bitbucket.status(s.directory, cfg.get("remote") or "origin")
+    draft = bitbucket.draft_description(s.data, await _diffstat(s.directory, st))
+    configured = bool(load_config()["bitbucket"].get("token"))
+    try:
+        target = bitbucket.resolve_target(cfg, st) if st.get("isRepo") else None
+    except bitbucket.BitbucketError as e:
+        target = {"error": str(e)}
+    return {**st, "draft": draft, "configured": configured, "target": target,
+            "pullRequests": s.data.get("pullRequests", [])}
+
+
+@app.post("/api/sessions/{sid}/pr")
+async def create_pr(sid: str, body: PullRequestIn) -> dict:
+    s = _get(sid)
+    if s.busy:
+        raise HTTPException(409, "Session is busy: wait for the agent to finish")
+    cfg = load_config()["bitbucket"]
+    try:
+        pr = await bitbucket.create_pull_request(s.directory, cfg, title=body.title.strip() or "Changes",
+                                                 description=body.description, branch=body.branch, target=body.target,
+                                                 commit_message=body.commitMessage)
+    except bitbucket.BitbucketError as e:
+        journal.log(s, "error", error=f"pull request: {e}")
+        raise HTTPException(400, str(e)) from e
+    entry = {**pr, "title": body.title, "createdAt": now_ms()}
+    s.data.setdefault("pullRequests", []).append(entry)
+    journal.log(s, "pr", url=pr["url"], branch=pr["branch"], target=pr["target"], steps=pr["steps"])
+    s.emit("pr.created", {"pr": entry})
+    s.touch()
+    return entry
+
+
+@app.post("/api/bitbucket/test")
+async def bitbucket_test(body: BitbucketTest) -> dict:
+    cfg = load_config()["bitbucket"]
+    if body.bitbucket:
+        cfg = {**cfg, **strip_masked({"bitbucket": dict(body.bitbucket)})["bitbucket"]}
+    try:
+        return await bitbucket.test(cfg, body.directory or "")
+    except (bitbucket.BitbucketError, httpx.HTTPError) as e:
+        return {"ok": False, "message": str(e)}
+
+
 @app.get("/api/sessions/{sid}/journal")
 async def get_journal(sid: str, limit: int = 1000) -> list:
     _get(sid)
@@ -458,7 +613,7 @@ def _attach_mentions(directory: str, text: str) -> str:
         if root not in p.parents or not p.is_file() or p.stat().st_size > 200_000:
             continue
         try:
-            content = p.read_text(encoding="utf-8")
+            content = read_text(p)
         except (OSError, UnicodeDecodeError):
             continue
         blocks.append(f'<file path="{raw}">\n{content}\n</file>')
@@ -491,11 +646,12 @@ def _start(s: Session, coro) -> None:
 def _spec_for(s: Session, agent: str) -> AgentSpec:
     cfg = load_config()
     custom = cfg["llm"].get("systemPrompt", "")
+    auto = auto_mode(cfg, s.data)
     if agent == "plan":
-        return AgentSpec("plan", prompts.system(s.directory, custom, prompts.PLAN),
+        return AgentSpec("plan", prompts.system(s.directory, custom, prompts.PLAN, auto=auto),
                          READ_ONLY + ["bash", "todowrite", "todoread", "question", "webfetch"], cfg["llm"]["model"],
                          permissions={"edit": "deny", "bash": "ask"}, pinned=0)
-    return AgentSpec("build", prompts.system(s.directory, custom, prompts.BUILD),
+    return AgentSpec("build", prompts.system(s.directory, custom, prompts.BUILD, auto=auto),
                      READ_ONLY + ["write", "edit", "multiedit", "apply_patch", "bash", "webfetch", "todowrite", "todoread",
                                   "question", "task"],
                      cfg["llm"]["model"], pinned=0)
@@ -606,7 +762,7 @@ async def list_files(sid: str, q: str = "") -> list:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
         for name in filenames:
-            relp = str((Path(dirpath) / name).relative_to(root))
+            relp = posix((Path(dirpath) / name).relative_to(root))
             if not q or q in relp.lower():
                 out.append(relp)
                 if len(out) >= 50:

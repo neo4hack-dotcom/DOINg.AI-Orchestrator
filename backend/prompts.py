@@ -10,20 +10,23 @@ import platform
 import time
 from pathlib import Path
 
-BASE = """You are DOINg.AI Orchestrator, an autonomous coding agent running on the user's machine against a local LLM.
+BASE = """You are DOINg.AI SuperCode, an autonomous coding agent running on the user's machine against a local LLM.
 
 Rules:
 - Use the tools to inspect and change the workspace. Never invent file contents: read before you edit.
 - Paths are relative to the workspace.
 - Save tokens: start with repomap or grep/glob instead of reading whole trees; read only the ranges you need;
   batch changes to one file with multiedit and multi-file changes with apply_patch.
-- Keep answers short and concrete. Use Markdown. Reference code as path:line.
-- Reply in the language the user writes in."""
+- Keep answers short and concrete. Use Markdown. Reference code as path:line."""
 
 ENV = """
 Workspace: {directory}
-Platform: {platform}. Today: {date}.
-{project_rules}"""
+Platform: {platform}. Shell for the bash tool: {shell}. Today: {date}.
+{auto}{project_rules}"""
+
+AUTO = """AUTO MODE: no human is watching. Never wait for a confirmation or an answer: when something is ambiguous,
+choose the most reasonable option, state the assumption in one line, and keep going.
+"""
 
 BUILD = """You are in BUILD mode: you may read, edit, write files and run commands.
 - For multi-step work, keep a todo list with todowrite and update it as you go.
@@ -133,7 +136,7 @@ ORCH_CLOSE = """You are the savvy-flow ORCHESTRATOR in phase CLOSE. Report to th
 - what was verified (commands and results);
 - what was left out or failed and why;
 - follow-ups noticed but not touched.
-End with one line naming which worker tiers ran. No per-task narration. Reply in the language of the user's request."""
+End with one line naming which worker tiers ran. No per-task narration."""
 
 GOAL_EVALUATOR = """You evaluate whether a coding agent has completed a session goal. Return strict JSON only:
 {"complete": true|false, "reason": "short", "next_instruction": "what to do next, or null"}
@@ -184,18 +187,26 @@ def _project_rules(directory: str) -> str:
     return ""
 
 
-def base(directory: str, custom: str = "") -> str:
+def base(directory: str, custom: str = "", language: str = "English") -> str:
     """Stable rules first; the caller appends the role; ``env`` goes last."""
-    return f"{BASE}\n{custom.strip()}" if custom and custom.strip() else BASE
+    text = f"{BASE}\n- Write every answer, report, plan and comment in {language or 'English'}."
+    return f"{text}\n{custom.strip()}" if custom and custom.strip() else text
 
 
-def env(directory: str) -> str:
+def env(directory: str, auto: bool = False) -> str:
+    from .config import load_config
+    from .osutil import shell_description
+
     return ENV.format(directory=directory, platform=f"{platform.system()} {platform.release()}",
-                      date=time.strftime("%Y-%m-%d"), project_rules=_project_rules(directory))
+                      shell=shell_description(load_config().get("shell", "auto")), date=time.strftime("%Y-%m-%d"),
+                      auto=AUTO if auto else "", project_rules=_project_rules(directory))
 
 
-def system(directory: str, custom: str, role: str) -> str:
-    return f"{base(directory, custom)}\n\n{role}\n{env(directory)}"
+def system(directory: str, custom: str, role: str, auto: bool = False) -> str:
+    from .config import load_config
+
+    language = load_config()["llm"].get("responseLanguage") or "English"
+    return f"{base(directory, custom, language)}\n\n{role}\n{env(directory, auto)}"
 
 
 def orch_plan(greenfield: bool) -> str:
