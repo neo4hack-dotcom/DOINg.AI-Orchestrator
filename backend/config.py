@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "edit": "allow",
         "bash": "ask",
         "webfetch": "ask",
+        # MCP tool calls (per-server overrides in mcp.servers.<name>.permission; read-only tools can be trusted).
+        "mcp": "ask",
+        # Installing / enabling a mod written by the agent (mods run inside the server).
+        "mods": "ask",
         # Evaluated per sub-command (split on && ; | ||). deny wins, then allow; else the category value.
         "bashRules": [
             {"pattern": "ls*", "action": "allow"},
@@ -156,6 +161,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "requireReadBeforeEdit": True,
         "goalMaxContinuations": 8,
     },
+    # Model Context Protocol servers (Claude Desktop / Claude Code format, plus our options).
+    "mcp": {
+        # name -> {type: stdio|http|sse, command, args, env, cwd, url, headers, enabled, permission (ask|allow|deny),
+        #          trustReadOnly, timeout, disabledTools, description}
+        "servers": {},
+        # "<resolved project dir>::<server>" entries the user approved from a project's .mcp.json
+        "approvedProjectServers": [],
+        # Above this many MCP tools, the agents get mcp_search + mcp_call instead of every schema (saves context).
+        "deferThreshold": 16,
+        "maxDescriptionChars": 400,
+        "inPlanMode": True,              # plan agent / orchestrator get the read-only MCP tools
+        "inWorkers": True,               # savvy workers get the MCP tools
+    },
+    # Agent Skills (SKILL.md folders): builtin, user (data/skills) and project (.supercode/skills, .claude/skills).
+    "skills": {"disabled": [], "modelInvocation": True},
+    # Mods: Python hooks on the agent's events (builtin + data/mods).
+    "mods": {"disabled": [], "enabled": [], "options": {}},
+    # Optional reverse-engineering layer (REA, https://github.com/morluto/rea, MIT) - lawful use only.
+    "reverse": {
+        "enabled": False,
+        "acknowledged": False,
+        "version": "6.4.0",
+        "provider": "auto",              # auto | hopper | ghidra | ida  (REA_ANALYSIS_PROVIDER)
+        "schemaProfile": "compact",      # REA_MCP_INPUT_SCHEMA_PROFILE: compact tool schemas suit local models
+        "timeout": 900,
+        "env": {},
+    },
     "nexusDbPath": "",
 }
 
@@ -193,7 +225,7 @@ def _sanitize(cfg: dict) -> dict:
         if tier.get("effort") not in EFFORTS:
             tier["effort"] = DEFAULT_CONFIG["tiers"][name]["effort"]
         tier["model"] = str(tier.get("model") or "")
-    for key in ("edit", "bash", "webfetch"):
+    for key in ("edit", "bash", "webfetch", "mcp", "mods"):
         if cfg["permissions"].get(key) not in PERMISSION_VALUES:
             cfg["permissions"][key] = DEFAULT_CONFIG["permissions"][key]
     rules = cfg["permissions"].get("bashRules")
@@ -207,10 +239,42 @@ def _sanitize(cfg: dict) -> dict:
     if not isinstance(cfg["verify"].get("commands"), list):
         cfg["verify"]["commands"] = []
     cfg["verify"]["commands"] = [str(c).strip() for c in cfg["verify"]["commands"] if str(c).strip()]
+    mcp = cfg["mcp"]
+    if not isinstance(mcp.get("servers"), dict):
+        mcp["servers"] = {}
+    mcp["servers"] = {str(n): _sanitize_server(v) for n, v in mcp["servers"].items() if isinstance(v, dict) and str(n).strip()}
+    mcp["approvedProjectServers"] = [str(x) for x in (mcp.get("approvedProjectServers") or [])]
+    mcp["deferThreshold"] = max(0, int(mcp.get("deferThreshold") or 0))
+    for section in ("skills", "mods"):
+        cfg[section]["disabled"] = sorted({str(x) for x in (cfg[section].get("disabled") or [])})
+    cfg["mods"]["enabled"] = sorted({str(x) for x in (cfg["mods"].get("enabled") or [])})
+    if not isinstance(cfg["mods"].get("options"), dict):
+        cfg["mods"]["options"] = {}
+    rev = cfg["reverse"]
+    if rev.get("provider") not in ("auto", "hopper", "ghidra", "ida"):
+        rev["provider"] = "auto"
+    if rev.get("schemaProfile") not in ("compact", "full"):
+        rev["schemaProfile"] = "compact"
+    rev["enabled"] = bool(rev.get("enabled")) and bool(rev.get("acknowledged"))
     flow = cfg["flow"]
     flow["maxParallel"] = max(1, min(8, int(flow.get("maxParallel") or 1)))
     flow["maxReturnRounds"] = max(0, min(5, int(flow.get("maxReturnRounds") or 0)))
     return cfg
+
+
+def _sanitize_server(raw: dict) -> dict:
+    srv = {k: v for k, v in raw.items() if k != "source"}
+    kind = srv.get("type") or ("http" if srv.get("url") else "stdio")
+    srv["type"] = kind if kind in ("stdio", "http", "sse") else "stdio"
+    srv["enabled"] = bool(srv.get("enabled", True))
+    if srv.get("permission") not in PERMISSION_VALUES:
+        srv["permission"] = "ask"
+    srv["trustReadOnly"] = bool(srv.get("trustReadOnly", True))
+    srv["args"] = [str(a) for a in (srv.get("args") or [])] if isinstance(srv.get("args"), list) else []
+    for key in ("env", "headers"):
+        srv[key] = {str(k): str(v) for k, v in (srv.get(key) or {}).items()} if isinstance(srv.get(key), dict) else {}
+    srv["disabledTools"] = [str(t) for t in (srv.get("disabledTools") or [])]
+    return srv
 
 
 def load_config() -> dict:
@@ -226,10 +290,23 @@ def load_config() -> dict:
 
 def save_config(update: dict) -> dict:
     cfg = _sanitize(_deep_merge(load_config(), update or {}))
+    _write(cfg)
+    return cfg
+
+
+def update_config(mutate) -> dict:
+    """Read-modify-write for changes a deep merge cannot express (deleting a server, a mod option...)."""
+    cfg = load_config()
+    mutate(cfg)
+    cfg = _sanitize(cfg)
+    _write(cfg)
+    return cfg
+
+
+def _write(cfg: dict) -> None:
     with _lock:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         atomic_write(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
-    return cfg
 
 
 def tier_model(cfg: dict, tier: str) -> str:
@@ -248,20 +325,55 @@ SECRET = "********"
 SECRET_PATHS = (("llm", "apiKey"), ("bitbucket", "token"))
 
 
+SECRET_KEY = re.compile(r"(key|token|secret|passw|auth|credential|cookie|session)", re.I)
+
+
+def mask_server(srv: dict) -> dict:
+    """MCP server for the browser: env / header values that look like secrets are masked."""
+    out = copy.deepcopy(srv)
+    for section in ("env", "headers"):
+        for k, v in (out.get(section) or {}).items():
+            if v and SECRET_KEY.search(k):
+                out[section][k] = SECRET
+    return out
+
+
+def unmask_server(new: dict, old: dict | None) -> dict:
+    """Masked values sent back by the browser keep the stored secret."""
+    for section in ("env", "headers"):
+        stored = (old or {}).get(section) or {}
+        for k, v in list((new.get(section) or {}).items()):
+            if v == SECRET:
+                if k in stored:
+                    new[section][k] = stored[k]
+                else:
+                    new[section].pop(k)
+    return new
+
+
 def public_config(cfg: dict) -> dict:
     """The config sent to the browser: secrets masked."""
     out = copy.deepcopy(cfg)
     for section, key in SECRET_PATHS:
         if out.get(section, {}).get(key):
             out[section][key] = SECRET
+    out["mcp"]["servers"] = {n: mask_server(s) for n, s in out["mcp"]["servers"].items()}
+    out["reverse"]["env"] = mask_server({"env": out["reverse"].get("env") or {}})["env"]
     return out
 
 
 def strip_masked(update: dict) -> dict:
-    """A save from the browser keeps stored secrets when it sends the mask back."""
+    """A save from the browser keeps stored secrets when it sends the mask back.
+
+    MCP servers are managed by their own endpoints (a deep merge cannot delete one)."""
     for section, key in SECRET_PATHS:
         if isinstance(update.get(section), dict) and update[section].get(key) == SECRET:
             update[section].pop(key)
+    if isinstance(update.get("mcp"), dict):
+        update["mcp"].pop("servers", None)
+        update["mcp"].pop("approvedProjectServers", None)
+    if isinstance(update.get("reverse"), dict) and isinstance(update["reverse"].get("env"), dict):
+        update["reverse"]["env"] = {k: v for k, v in update["reverse"]["env"].items() if v != SECRET}
     return update
 
 

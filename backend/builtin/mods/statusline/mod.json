@@ -1,0 +1,12 @@
+{
+  "name": "statusline",
+  "version": "1.0.0",
+  "description": "Status line under the prompt: git branch and uncommitted changes, model, context usage, tokens and last turn time.",
+  "inspiredBy": "ccstatusline / dcc-statusline (Claude Code status line plugins)",
+  "enabledByDefault": true,
+  "options": {
+    "showGit": {"default": true, "description": "Branch and number of uncommitted files"},
+    "showTokens": {"default": true, "description": "Session input / output tokens"},
+    "showTurnTime": {"default": true, "description": "Duration of the last turn"}
+  }
+}

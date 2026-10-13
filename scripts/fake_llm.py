@@ -139,7 +139,8 @@ def brain(messages: list[dict]) -> tuple[str, list[dict]]:
     if not after_tool:
         if re.search(r"\brun\b", last_user.lower()) and "READ-ONLY" not in system:
             return "Running it.", [{"name": "bash", "arguments": {"command": "printf 'hello from bash\\n'"}}]
-        return "I'll look around first.", [{"name": "list", "arguments": {"path": "."}}]
+        return ("<think>The user wants to know about the workspace. Listing it is the cheapest first step; "
+                "then I can answer precisely.</think>I'll look around first."), [{"name": "list", "arguments": {"path": "."}}]
     return f"Here is what I found. You said: **{last_user[:80]}**\n\n- The workspace is listed above.\n- Nothing else to do.", []
 
 

@@ -70,6 +70,8 @@ class ToolContext:
     ask: Optional[Callable[[list], Awaitable[list]]] = None
     notes: Optional[Callable[[str, str], list]] = None  # (action, text) -> notes
     repo_map_chars: int = 6000
+    # Folders outside the workspace the agent may read (loaded skills and their reference files).
+    extra_read_roots: list[Path] = field(default_factory=list)
 
 
 def _clip(text: str, limit: int = MAX_OUTPUT) -> str:
@@ -104,6 +106,8 @@ def resolve(ctx: ToolContext, raw: str, *, for_read: bool = False) -> Path:
     if p != root and root not in p.parents:
         spill = SPILL_DIR.resolve()
         if for_read and spill in p.parents:
+            return p
+        if for_read and any(r == p or r in p.parents for r in (x.resolve() for x in ctx.extra_read_roots)):
             return p
         raise ToolError(f"{raw} is outside the workspace {root}")
     return p
@@ -288,7 +292,7 @@ async def t_write(ctx: ToolContext, args: dict) -> ToolResult:
         _mark_read(ctx, p)
     diff = make_diff(rel(ctx, p), before or "", content)
     verb = "Updated" if before is not None else "Created"
-    return ToolResult(f"{verb} {rel(ctx, p)} ({len(content.splitlines())} lines)", rel(ctx, p), {"diff": diff, **_diff_stats(diff)})
+    return ToolResult(f"{verb} {rel(ctx, p)} ({len(content.splitlines())} lines)", rel(ctx, p), {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff)})
 
 
 async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult:
@@ -301,7 +305,7 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
                 write_text(p, first.get("new_string") or "")
                 _mark_read(ctx, p)
                 diff = make_diff(rel(ctx, p), "", first.get("new_string") or "")
-                return ToolResult(f"Created {rel(ctx, p)}", rel(ctx, p), {"diff": diff, **_diff_stats(diff)})
+                return ToolResult(f"Created {rel(ctx, p)}", rel(ctx, p), {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff)})
             raise ToolError(f"File not found: {rel(ctx, p)}. Use write to create it.")
         _check_fresh(ctx, p)
         before = read_text(p)
@@ -325,7 +329,7 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
     loose = [s for s in strategies if s != "exact"]
     note = f" (matched with {', '.join(sorted(set(loose)))})" if loose else ""
     return ToolResult(f"Edited {rel(ctx, p)}: {len(edits)} change(s){note}", rel(ctx, p),
-                      {"diff": diff, **_diff_stats(diff), "strategies": strategies})
+                      {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff), "strategies": strategies})
 
 
 async def t_edit(ctx: ToolContext, args: dict) -> ToolResult:
@@ -406,7 +410,9 @@ async def t_apply_patch(ctx: ToolContext, args: dict) -> ToolResult:
         for lk in locks:
             lk.release()
     diff = "".join(diffs)
-    return ToolResult("Patch applied:\n" + "\n".join(summary), f"{len(planned)} file(s)", {"diff": diff, **_diff_stats(diff)})
+    files = [rel(ctx, dest or p) for kind, p, dest, _b, _a in planned if kind != "delete"]
+    return ToolResult("Patch applied:\n" + "\n".join(summary), f"{len(planned)} file(s)",
+                      {"diff": diff, "files": files, **_diff_stats(diff)})
 
 
 async def t_bash(ctx: ToolContext, args: dict) -> ToolResult:
@@ -568,8 +574,10 @@ class ToolDef:
     description: str
     parameters: dict
     run: ToolFn
-    permission: Optional[str] = None  # "edit" | "bash" | "webfetch" | None
+    permission: Optional[str] = None  # "edit" | "bash" | "webfetch" | "mcp" | "mods" | None
     mutates: bool = False
+    # Extension data: MCP server / tool, read-only hint, owning mod or skill.
+    meta: dict = field(default_factory=dict)
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}

@@ -1,0 +1,11 @@
+{
+  "name": "commit-commands",
+  "version": "1.0.0",
+  "description": "/commit stages everything and commits with a generated Conventional Commits message; /clean-gone deletes local branches whose remote is gone. A band above the prompt offers a commit after a turn that changed files.",
+  "inspiredBy": "Anthropic's official commit-commands plugin for Claude Code",
+  "enabledByDefault": true,
+  "options": {
+    "conventional": {"default": true, "description": "Conventional Commits format (type(scope): summary)"},
+    "showBand": {"default": true, "description": "Offer a commit above the prompt when the working tree has changes"}
+  }
+}

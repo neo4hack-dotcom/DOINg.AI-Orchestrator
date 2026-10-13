@@ -22,10 +22,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import compaction, journal, llm, permissions
+from . import compaction, extensions, journal, llm, mcp_tools, mods, permissions
 from .config import auto_mode, load_config
 from .session import MessageSink, Session, new_id, now_ms
-from .tools import TOOLS, ToolContext, ToolError, _clip, bound_output
+from .tools import TOOLS, ToolContext, ToolDef, ToolError, _clip, bound_output
 
 UI_OUTPUT_LIMIT = 12_000
 
@@ -49,6 +49,10 @@ class AgentSpec:
     on_usage: Optional[Callable[[llm.ChatResult], None]] = None
     # Called before each tool call (step counters for runs).
     on_tool: Optional[Callable[[llm.ToolCall], None]] = None
+    # MCP tools, skills and mod tools/prompt sections: "all", "local" (no MCP), "read" (read-only agents) or "none".
+    extensions: str = "none"
+    # Tools specific to this agent (e.g. the mod builder's mod_validate / mod_install).
+    extra_tools: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -88,7 +92,8 @@ async def _wait_user(session: Session, registry: str, entry: dict) -> str:
         store.pop(entry["id"], None)
 
 
-async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str) -> str:
+async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str,
+                         grant: Optional[str] = None) -> str:
     entry = {
         "id": new_id("perm"), "category": category, "tool": part["tool"], "input": part["input"], "agent": agent,
         "runId": sink.run_id, "messageId": msg["id"], "partId": part["id"], "status": "pending", "createdAt": now_ms(),
@@ -99,7 +104,7 @@ async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: d
     entry["status"] = {"once": "allowed", "always": "allowed", "reject": "rejected"}.get(response, "rejected")
     if response == "always":
         grants = session.data.setdefault("alwaysAllow", [])
-        grant = permissions.grant_pattern(part["input"].get("command", "")) if category == "bash" else category
+        grant = grant or (permissions.grant_pattern(part["input"].get("command", "")) if category == "bash" else category)
         if grant not in grants:
             grants.append(grant)
     session.emit("permission.resolved", {"permission": entry})
@@ -122,20 +127,35 @@ async def ask_questions(session: Session, agent: str, run_id: Optional[str], que
     return answers
 
 
-def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict) -> str:
+def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
+                       tool: Optional[ToolDef] = None) -> str:
     if not category:
         return "allow"
-    cfg = load_config()["permissions"]
-    value = spec.permissions.get(category, cfg.get(category, "ask"))
+    full = load_config()
+    cfg = full["permissions"]
     grants = session.data.get("alwaysAllow", [])
-    if category == "bash":
-        value = permissions.bash_decision(str(args.get("command") or ""), cfg.get("bashRules", []), value, grants)
-    elif value == "ask" and category in grants:
-        value = "allow"
+    if category == "mcp" and tool is not None:
+        servers = mcp_tools.session_servers(full, session)
+        value = mcp_tools.decision(full, servers, mcp_tools.tool_server(tool, args), mcp_tools.tool_read_only(tool, args), grants)
+        if spec.permissions.get("mcp") in ("deny", "ask") and value != "deny":
+            value = spec.permissions["mcp"]
+    else:
+        value = spec.permissions.get(category, cfg.get(category, "ask"))
+        if category == "bash":
+            value = permissions.bash_decision(str(args.get("command") or ""), cfg.get("bashRules", []), value, grants)
+        elif value == "ask" and category in grants:
+            value = "allow"
     forced_ask = spec.permissions.get(category) == "ask"
-    if value == "ask" and not forced_ask and auto_mode(load_config(), session.data):
+    if value == "ask" and not forced_ask and auto_mode(full, session.data):
         value = "allow"
     return value
+
+
+def _grant_for(tool: ToolDef, args: dict) -> Optional[str]:
+    if tool.permission == "mcp":
+        server = mcp_tools.tool_server(tool, args)
+        return f"mcp:{server}" if server else "mcp"
+    return None
 
 
 AUTO_ANSWER = ("No user is available (auto mode). Choose the most reasonable option yourself, "
@@ -152,8 +172,10 @@ async def auto_answer(session: Session, agent: str, questions: list[dict]) -> li
 
 
 async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: AgentSpec, ctx: ToolContext,
-                       call: llm.ToolCall, output_limit: int) -> tuple[str, bool]:
-    """Returns (text for the model, ok)."""
+                       call: llm.ToolCall, output_limit: int, registry: Optional[dict[str, ToolDef]] = None) -> tuple[str, bool]:
+    """Returns (text for the model, ok). Mods' ``tool.call`` hooks wrap permission + execution."""
+    if registry is None:
+        registry = {n: TOOLS[n] for n in spec.tools if n in TOOLS}
     part = sink.add_part(msg, {
         "type": "tool", "tool": call.name, "callId": call.id, "input": call.arguments,
         "status": "running", "title": "", "output": "", "metadata": {}, "startedAt": now_ms(),
@@ -161,7 +183,7 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
     started = time.monotonic()
     args = call.arguments
     target = str(args.get("path") or args.get("command") or args.get("pattern") or args.get("url")
-                 or args.get("description") or "")[:200]
+                 or args.get("description") or args.get("tool") or args.get("name") or "")[:200]
 
     def finish(status: str, output: str, title: str = "", metadata: Optional[dict] = None) -> None:
         meta = metadata or {}
@@ -171,47 +193,60 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
         journal.log(session, "tool", agent=spec.name, runId=sink.run_id, tool=call.name, target=target, status=status,
                     ms=int((time.monotonic() - started) * 1000),
                     **({"exitCode": meta["exitCode"]} if "exitCode" in meta else {}),
+                    **({"mcp": meta["mcp"]} if "mcp" in meta else {}),
+                    **({"skill": meta["skill"]} if "skill" in meta else {}),
                     **({"error": output[:300]} if status == "error" else {}))
 
-    tool = TOOLS.get(call.name)
-    if not tool or call.name not in spec.tools:
-        text = f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(spec.tools)}"
-        finish("error", text)
-        return text, False
-
-    decision = resolve_permission(session, spec, tool.permission, args)
-    if decision == "deny":
-        text = (f"Permission denied: this {tool.permission} action is not allowed for the {spec.name} agent "
-                "(deny rule or read-only mode). Use another approach.")
-        finish("error", text)
-        return text, False
-    if decision == "ask":
-        part["status"] = "waiting"
-        sink.update_part(msg, part)
+    async def engine(ev: dict) -> dict:
+        a = ev.get("input") if isinstance(ev.get("input"), dict) else args
+        if a is not args:  # rewritten by a mod
+            part["input"] = a
+            sink.update_part(msg, part)
+        tool = registry.get(call.name)
+        if not tool:
+            return {"ok": False, "output": f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(registry)}"}
+        decision = resolve_permission(session, spec, tool.permission, a, tool)
+        if decision == "deny":
+            return {"ok": False, "output": (f"Permission denied: this {tool.permission} action is not allowed for the {spec.name} "
+                                            "agent (deny rule or read-only mode). Use another approach.")}
+        if decision == "ask":
+            part["status"] = "waiting"
+            sink.update_part(msg, part)
+            answer = await ask_permission(session, sink, msg, part, tool.permission, spec.name, _grant_for(tool, a))
+            if answer == "reject":
+                return {"ok": False, "display": "Rejected by user",
+                        "output": "The user rejected this tool call. Do not retry it; adapt your approach or ask the user."}
+            part["status"] = "running"
+            sink.update_part(msg, part)
         try:
-            answer = await ask_permission(session, sink, msg, part, tool.permission, spec.name)
+            result = await tool.run(ctx, a)
         except asyncio.CancelledError:
-            finish("error", "Aborted")
             raise
-        if answer == "reject":
-            finish("error", "Rejected by user")
-            return "The user rejected this tool call. Do not retry it; adapt your approach or ask the user.", False
-        part["status"] = "running"
-        sink.update_part(msg, part)
+        except ToolError as e:
+            return {"ok": False, "output": f"Error: {e}", "display": str(e)}
+        except Exception as e:  # noqa: BLE001 - reported to the model, which can recover
+            return {"ok": False, "output": f"Error: {type(e).__name__}: {e}", "display": f"{type(e).__name__}: {e}"}
+        return {"ok": True, "output": result.output, "title": result.title, "metadata": dict(result.metadata)}
 
+    event = {"tool": call.name, "input": args, "agent": spec.name, "runId": sink.run_id}
     try:
-        result = await tool.run(ctx, args)
+        res = await mods.dispatch("tool.call", session, event, engine, tool_ctx=ctx)
     except asyncio.CancelledError:
         finish("error", "Aborted")
         raise
-    except ToolError as e:
-        finish("error", str(e))
-        return f"Error: {e}", False
-    except Exception as e:  # noqa: BLE001 - reported to the model, which can recover
-        finish("error", f"{type(e).__name__}: {e}")
-        return f"Error: {type(e).__name__}: {e}", False
-    model_text, spill = bound_output(result.output, output_limit)
-    finish("done", result.output, result.title, {**result.metadata, **({"spill": spill} if spill else {})})
+    if not isinstance(res, dict):
+        res = {"ok": True, "output": str(res)}
+    if "deny" in res:
+        text = f"Blocked by the {res.get('mod') or 'a'} mod: {res['deny']}"
+        finish("error", text, metadata={"blockedBy": res.get("mod") or "mod"})
+        return text + " Do not retry the same action; adapt your approach.", False
+    output = str(res.get("output", ""))
+    if not res.get("ok", True):
+        finish("error", str(res.get("display") or output))
+        return output, False
+    model_text, spill = bound_output(output, output_limit)
+    meta = dict(res.get("metadata") or {})
+    finish("done", output, str(res.get("title") or ""), {**meta, **({"spill": spill} if spill else {})})
     return model_text, True
 
 
@@ -229,7 +264,10 @@ async def _call_llm(session: Session, sink: MessageSink, spec: AgentSpec, cfg: d
 
         async def on_delta(kind: str, chunk: str) -> None:
             if kind not in parts:
-                parts[kind] = sink.add_part(msg, {"type": kind, "text": ""})
+                parts[kind] = sink.add_part(msg, {"type": kind, "text": "", **({"startedAt": now_ms()} if kind == "reasoning" else {})})
+            if kind == "text" and "reasoning" in parts and not parts["reasoning"].get("endedAt"):
+                parts["reasoning"]["endedAt"] = now_ms()
+                sink.update_part(msg, parts["reasoning"])
             sink.delta(msg, parts[kind], chunk)
 
         try:
@@ -300,6 +338,13 @@ async def run_agent(
         else:
             ctx.ask = lambda qs: ask_questions(session, spec.name, sink.run_id, qs)
 
+    def notify(text: str) -> None:
+        note = sink.add_message("assistant", spec.name, spec.model)
+        sink.add_part(note, {"type": "notice", "text": text})
+
+    extras = await extensions.prepare(session, spec, ctx, notify)
+    registry: dict[str, ToolDef] = {**{n: TOOLS[n] for n in spec.tools if n in TOOLS}, **extras.tools, **spec.extra_tools}
+
     steps = in_tok = out_tok = 0
     final_text = ""
     exhausted = overflowed = nudged = False
@@ -310,9 +355,9 @@ async def run_agent(
     while True:
         await _manage_context(session, sink, spec, cfg, ctx_cfg, history, window)
         mode = _tool_mode(cfg, spec.model)
-        tool_defs = [TOOLS[n] for n in spec.tools if n in TOOLS] if not exhausted else []
+        tool_defs = list(registry.values()) if not exhausted else []
         schemas = [t.schema() for t in tool_defs]
-        system = spec.system
+        system = spec.system + extras.system
         convo = history
         if mode == "prompt":
             if schemas:
@@ -350,7 +395,12 @@ async def run_agent(
         elif text:
             sink.add_part(msg, {"type": "text", "text": text})
         if "reasoning" in parts:
+            parts["reasoning"].setdefault("endedAt", now_ms())
             sink.update_part(msg, parts["reasoning"])
+        elif res.reasoning and res.reasoning.strip():
+            # Some servers return the reasoning in one piece at the end (no stream).
+            sink.add_part(msg, {"type": "reasoning", "text": res.reasoning, "startedAt": msg.get("createdAt") or now_ms(),
+                                "endedAt": now_ms()})
 
         in_tok += res.prompt_tokens
         out_tok += res.completion_tokens
@@ -389,7 +439,7 @@ async def run_agent(
                 output, ok = (f"Doom-loop guard: you called {call.name} with identical arguments {loop_threshold} times "
                               "in a row. It will not run again. Change your approach, or finish with what you have."), False
             else:
-                output, ok = await execute_tool(session, sink, msg, spec, ctx, call, output_limit)
+                output, ok = await execute_tool(session, sink, msg, spec, ctx, call, output_limit, registry)
             failures_in_row = 0 if ok else failures_in_row + 1
             history.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": output})
 
@@ -412,12 +462,12 @@ async def run_agent(
     return AgentOutcome(final_text, steps, in_tok, out_tok, stopped)
 
 
-def make_context(session: Session, agent: str, run: Optional[dict] = None) -> ToolContext:
+def make_context(session: Session, agent: str, run: Optional[dict] = None, directory: Optional[str] = None) -> ToolContext:
     def on_todos(todos: list) -> None:
         session.data["todos"] = todos
         session.emit("todos.updated", {"todos": todos})
         session.touch()
 
     cfg = load_config()
-    return ToolContext(directory=Path(session.directory), session=session, agent=agent, run=run, on_todos=on_todos,
+    return ToolContext(directory=Path(directory or session.directory), session=session, agent=agent, run=run, on_todos=on_todos,
                        repo_map_chars=int(cfg["context"].get("repoMapChars") or 6000))
