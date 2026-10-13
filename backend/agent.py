@@ -1,0 +1,423 @@
+"""The agent loop shared by every role: build, plan, savvy orchestrator, savvy workers.
+
+One turn: send history to the LLM, stream text into the transcript, run the tool
+calls it asked for (asking the user when a permission says so), feed results back,
+repeat until the model answers without tools or the step budget is spent.
+
+Long-run hardening (OpenCode / OpenClaude):
+- transient LLM errors are retried with exponential backoff and jitter;
+- old tool outputs are pruned and old history is summarized into a checkpoint
+  before the context fills up; a context-overflow error triggers a compaction;
+- identical tool calls repeated in a row are blocked (doom-loop guard);
+- long tool outputs are cut and spilled to a file;
+- every tool call is written to the session journal.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from . import compaction, journal, llm, permissions
+from .config import auto_mode, load_config
+from .session import MessageSink, Session, new_id, now_ms
+from .tools import TOOLS, ToolContext, ToolError, _clip, bound_output
+
+UI_OUTPUT_LIMIT = 12_000
+
+# Models that refused native tools: (provider, baseUrl, model) -> use the text protocol.
+_text_protocol: set[tuple[str, str, str]] = set()
+
+
+@dataclass
+class AgentSpec:
+    name: str
+    system: str
+    tools: list[str]
+    model: str
+    max_steps: int = 50
+    temperature: Optional[float] = None
+    # Per-category overrides of the configured permissions ("allow" | "ask" | "deny").
+    permissions: dict = field(default_factory=dict)
+    # Leading history messages never summarized away (the request / the brief).
+    pinned: int = 1
+    # Called with every ChatResult (token / context accounting for runs).
+    on_usage: Optional[Callable[[llm.ChatResult], None]] = None
+    # Called before each tool call (step counters for runs).
+    on_tool: Optional[Callable[[llm.ToolCall], None]] = None
+
+
+@dataclass
+class AgentOutcome:
+    text: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    stopped: str = ""  # "" | "loop" | "budget"
+
+
+def _tool_mode(cfg: dict, model: str) -> str:
+    if cfg.get("provider") == "n8n" or cfg.get("toolMode") == "prompt":
+        return "prompt"
+    if cfg.get("toolMode") == "native":
+        return "native"
+    key = (cfg.get("provider", ""), cfg.get("baseUrl", ""), model)
+    return "prompt" if key in _text_protocol else "native"
+
+
+# ---------------------------------------------------------------------------
+# permissions and questions
+
+
+async def _wait_user(session: Session, registry: str, entry: dict) -> str:
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    store = session.permissions if registry == "permission" else session.questions
+    store[entry["id"]] = fut
+    session.emit(f"{registry}.asked", {registry: entry})
+    try:
+        return await fut
+    except asyncio.CancelledError:
+        entry["status"] = "rejected"
+        session.emit(f"{registry}.resolved", {registry: entry})
+        raise
+    finally:
+        store.pop(entry["id"], None)
+
+
+async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str) -> str:
+    entry = {
+        "id": new_id("perm"), "category": category, "tool": part["tool"], "input": part["input"], "agent": agent,
+        "runId": sink.run_id, "messageId": msg["id"], "partId": part["id"], "status": "pending", "createdAt": now_ms(),
+    }
+    session.data.setdefault("permissionLog", []).append(entry)
+    part["permissionId"] = entry["id"]
+    response = await _wait_user(session, "permission", entry)
+    entry["status"] = {"once": "allowed", "always": "allowed", "reject": "rejected"}.get(response, "rejected")
+    if response == "always":
+        grants = session.data.setdefault("alwaysAllow", [])
+        grant = permissions.grant_pattern(part["input"].get("command", "")) if category == "bash" else category
+        if grant not in grants:
+            grants.append(grant)
+    session.emit("permission.resolved", {"permission": entry})
+    journal.log(session, "permission", tool=part["tool"], category=category, agent=agent, status=entry["status"],
+                target=str(part["input"].get("command") or part["input"].get("path") or "")[:200])
+    session.touch()
+    return response
+
+
+async def ask_questions(session: Session, agent: str, run_id: Optional[str], questions: list[dict]) -> list[list[str]]:
+    entry = {"id": new_id("q"), "agent": agent, "runId": run_id, "questions": questions, "status": "pending",
+             "createdAt": now_ms(), "answers": None}
+    session.data.setdefault("questionLog", []).append(entry)
+    answers = await _wait_user(session, "question", entry)
+    answers = [[str(a) for a in (ans if isinstance(ans, list) else [ans])] for ans in (answers or [])]
+    entry.update(status="answered", answers=answers)
+    session.emit("question.resolved", {"question": entry})
+    journal.log(session, "question", agent=agent, questions=[q["question"] for q in questions], answers=answers)
+    session.touch()
+    return answers
+
+
+def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict) -> str:
+    if not category:
+        return "allow"
+    cfg = load_config()["permissions"]
+    value = spec.permissions.get(category, cfg.get(category, "ask"))
+    grants = session.data.get("alwaysAllow", [])
+    if category == "bash":
+        value = permissions.bash_decision(str(args.get("command") or ""), cfg.get("bashRules", []), value, grants)
+    elif value == "ask" and category in grants:
+        value = "allow"
+    forced_ask = spec.permissions.get(category) == "ask"
+    if value == "ask" and not forced_ask and auto_mode(load_config(), session.data):
+        value = "allow"
+    return value
+
+
+AUTO_ANSWER = ("No user is available (auto mode). Choose the most reasonable option yourself, "
+               "state the assumption in one line, and continue.")
+
+
+async def auto_answer(session: Session, agent: str, questions: list[dict]) -> list[list[str]]:
+    journal.log(session, "question", agent=agent, questions=[q["question"] for q in questions], auto=True)
+    return [[AUTO_ANSWER] for _ in questions]
+
+
+# ---------------------------------------------------------------------------
+# tools
+
+
+async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: AgentSpec, ctx: ToolContext,
+                       call: llm.ToolCall, output_limit: int) -> tuple[str, bool]:
+    """Returns (text for the model, ok)."""
+    part = sink.add_part(msg, {
+        "type": "tool", "tool": call.name, "callId": call.id, "input": call.arguments,
+        "status": "running", "title": "", "output": "", "metadata": {}, "startedAt": now_ms(),
+    })
+    started = time.monotonic()
+    args = call.arguments
+    target = str(args.get("path") or args.get("command") or args.get("pattern") or args.get("url")
+                 or args.get("description") or "")[:200]
+
+    def finish(status: str, output: str, title: str = "", metadata: Optional[dict] = None) -> None:
+        meta = metadata or {}
+        part.update(status=status, output=_clip(output, UI_OUTPUT_LIMIT), title=title or part["title"],
+                    metadata=meta, endedAt=now_ms())
+        sink.update_part(msg, part)
+        journal.log(session, "tool", agent=spec.name, runId=sink.run_id, tool=call.name, target=target, status=status,
+                    ms=int((time.monotonic() - started) * 1000),
+                    **({"exitCode": meta["exitCode"]} if "exitCode" in meta else {}),
+                    **({"error": output[:300]} if status == "error" else {}))
+
+    tool = TOOLS.get(call.name)
+    if not tool or call.name not in spec.tools:
+        text = f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(spec.tools)}"
+        finish("error", text)
+        return text, False
+
+    decision = resolve_permission(session, spec, tool.permission, args)
+    if decision == "deny":
+        text = (f"Permission denied: this {tool.permission} action is not allowed for the {spec.name} agent "
+                "(deny rule or read-only mode). Use another approach.")
+        finish("error", text)
+        return text, False
+    if decision == "ask":
+        part["status"] = "waiting"
+        sink.update_part(msg, part)
+        try:
+            answer = await ask_permission(session, sink, msg, part, tool.permission, spec.name)
+        except asyncio.CancelledError:
+            finish("error", "Aborted")
+            raise
+        if answer == "reject":
+            finish("error", "Rejected by user")
+            return "The user rejected this tool call. Do not retry it; adapt your approach or ask the user.", False
+        part["status"] = "running"
+        sink.update_part(msg, part)
+
+    try:
+        result = await tool.run(ctx, args)
+    except asyncio.CancelledError:
+        finish("error", "Aborted")
+        raise
+    except ToolError as e:
+        finish("error", str(e))
+        return f"Error: {e}", False
+    except Exception as e:  # noqa: BLE001 - reported to the model, which can recover
+        finish("error", f"{type(e).__name__}: {e}")
+        return f"Error: {type(e).__name__}: {e}", False
+    model_text, spill = bound_output(result.output, output_limit)
+    finish("done", result.output, result.title, {**result.metadata, **({"spill": spill} if spill else {})})
+    return model_text, True
+
+
+# ---------------------------------------------------------------------------
+# the loop
+
+
+async def _call_llm(session: Session, sink: MessageSink, spec: AgentSpec, cfg: dict, agent_cfg: dict,
+                    messages: list[dict], schemas: list[dict], mode: str, json_mode: bool):
+    """One LLM call streamed into a fresh message, retried on transient errors."""
+    attempt = 0
+    while True:
+        msg = sink.add_message("assistant", spec.name, spec.model)
+        parts: dict[str, dict] = {}
+
+        async def on_delta(kind: str, chunk: str) -> None:
+            if kind not in parts:
+                parts[kind] = sink.add_part(msg, {"type": kind, "text": ""})
+            sink.delta(msg, parts[kind], chunk)
+
+        try:
+            res = await llm.chat(
+                cfg, model=spec.model, messages=messages,
+                tools=schemas if (mode == "native" and schemas) else None,
+                on_delta=on_delta, json_mode=json_mode, temperature=spec.temperature,
+            )
+            return msg, parts, res
+        except llm.LLMError as e:
+            for p in parts.values():  # drop the partial stream
+                p["hidden"] = True
+                sink.update_part(msg, p)
+            if isinstance(e, (llm.ToolsUnsupported, llm.ContextOverflow)) or not e.transient:
+                raise
+            attempt += 1
+            max_retries = int(agent_cfg.get("maxRetries", 4))
+            if attempt > max_retries:
+                raise
+            base = float(agent_cfg.get("retryBaseSeconds", 2.0))
+            delay = min(60.0, base * 2.0 ** (attempt - 1)) + random.uniform(0, base * 0.75)
+            sink.add_part(msg, {"type": "notice", "text": f"LLM error, retry {attempt}/{max_retries} in {delay:.0f}s: {str(e)[:160]}"})
+            journal.log(session, "retry", agent=spec.name, runId=sink.run_id, attempt=attempt, error=str(e)[:300])
+            await asyncio.sleep(delay)
+
+
+async def _manage_context(session: Session, sink: MessageSink, spec: AgentSpec, cfg: dict, ctx_cfg: dict,
+                          history: list[dict], window: int, force: bool = False) -> None:
+    cleared = compaction.prune(history, window, {**ctx_cfg, **({"pruneAt": 0} if force else {})})
+    if cleared:
+        journal.log(session, "prune", agent=spec.name, runId=sink.run_id, cleared=cleared)
+    if not (force or compaction.needs_summary(history, window, ctx_cfg)):
+        return
+    keep_cfg = {**ctx_cfg, "keepRecentShare": float(ctx_cfg.get("keepRecentShare", 0.3)) * (0.5 if force else 1)}
+    try:
+        stats = await compaction.summarize(cfg, spec.model, history, window, keep_cfg, spec.pinned)
+    except llm.LLMError as e:
+        journal.log(session, "error", agent=spec.name, error=f"compaction failed: {e}")
+        return
+    if stats:
+        msg = sink.add_message("assistant", spec.name, spec.model)
+        sink.add_part(msg, {"type": "compaction", "text": stats["summary"], "before": stats["before"], "after": stats["after"]})
+        journal.log(session, "compaction", agent=spec.name, runId=sink.run_id, before=stats["before"], after=stats["after"])
+        session.data["compactions"] = session.data.get("compactions", 0) + 1
+        if spec.on_usage:
+            spec.on_usage(llm.ChatResult("", prompt_tokens=stats["tokens"], completion_tokens=0))
+
+
+async def run_agent(
+    session: Session,
+    spec: AgentSpec,
+    history: list[dict],
+    sink: MessageSink,
+    ctx: ToolContext,
+    *,
+    json_mode: bool = False,
+) -> AgentOutcome:
+    """Run until the model answers without tools. ``history`` is extended in place."""
+    full_cfg = load_config()
+    cfg, ctx_cfg, agent_cfg = full_cfg["llm"], full_cfg["context"], full_cfg["agent"]
+    window = int(cfg.get("contextWindow") or 16384)
+    output_limit = int(ctx_cfg.get("toolOutputMaxChars") or 12000)
+    loop_threshold = max(2, int(agent_cfg.get("doomLoopThreshold") or 3))
+    ctx.require_read = bool(agent_cfg.get("requireReadBeforeEdit", True))
+    if "question" in spec.tools and ctx.ask is None:
+        if auto_mode(full_cfg, session.data):
+            ctx.ask = lambda qs: auto_answer(session, spec.name, qs)
+        else:
+            ctx.ask = lambda qs: ask_questions(session, spec.name, sink.run_id, qs)
+
+    steps = in_tok = out_tok = 0
+    final_text = ""
+    exhausted = overflowed = nudged = False
+    recent: list[str] = []
+    loop_hits = failures_in_row = 0
+    stopped = ""
+
+    while True:
+        await _manage_context(session, sink, spec, cfg, ctx_cfg, history, window)
+        mode = _tool_mode(cfg, spec.model)
+        tool_defs = [TOOLS[n] for n in spec.tools if n in TOOLS] if not exhausted else []
+        schemas = [t.schema() for t in tool_defs]
+        system = spec.system
+        convo = history
+        if mode == "prompt":
+            if schemas:
+                system = f"{system}\n\n{llm.tool_protocol_prompt(schemas)}"
+            convo = llm.flatten_for_text_protocol(history)
+        messages = [{"role": "system", "content": system}] + convo
+
+        try:
+            msg, parts, res = await _call_llm(session, sink, spec, cfg, agent_cfg, messages, schemas, mode, json_mode)
+        except llm.ToolsUnsupported:
+            _text_protocol.add((cfg.get("provider", ""), cfg.get("baseUrl", ""), spec.model))
+            notice = sink.add_message("assistant", spec.name, spec.model)
+            sink.add_part(notice, {"type": "notice", "text": f"{spec.model}: native tool calling unavailable, switching to the text tool protocol."})
+            continue
+        except llm.ContextOverflow:
+            if overflowed:
+                raise
+            overflowed = True
+            await _manage_context(session, sink, spec, cfg, ctx_cfg, history, window, force=True)
+            continue
+        overflowed = False
+
+        known = {t.name for t in tool_defs}
+        text, calls = res.text, res.tool_calls
+        if known and (mode == "prompt" or not calls):
+            text, parsed = llm.parse_text_tool_calls(text, known)
+            calls = calls or parsed
+        text = text.strip()
+
+        if "text" in parts:
+            parts["text"]["text"] = text
+            sink.update_part(msg, parts["text"])
+            if not text:
+                msg["parts"].remove(parts["text"])
+        elif text:
+            sink.add_part(msg, {"type": "text", "text": text})
+        if "reasoning" in parts:
+            sink.update_part(msg, parts["reasoning"])
+
+        in_tok += res.prompt_tokens
+        out_tok += res.completion_tokens
+        msg["tokens"] = {"input": res.prompt_tokens, "output": res.completion_tokens}
+        tot = session.data.setdefault("tokens", {"input": 0, "output": 0})
+        tot["input"] += res.prompt_tokens
+        tot["output"] += res.completion_tokens
+        if sink.run_id is None:
+            session.data["contextTokens"] = res.prompt_tokens + res.completion_tokens
+        sink.update_message(msg)
+        if spec.on_usage:
+            spec.on_usage(res)
+
+        history.append({
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in calls],
+        })
+        if not calls:
+            history[-1].pop("tool_calls")
+            final_text = text
+            if not text and not msg["parts"]:
+                sink.add_part(msg, {"type": "notice", "text": "The model returned an empty answer."})
+            break
+
+        for call in calls:
+            steps += 1
+            if spec.on_tool:
+                spec.on_tool(call)
+            signature = call.name + json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
+            recent.append(signature)
+            if len(recent) >= loop_threshold and len(set(recent[-loop_threshold:])) == 1:
+                loop_hits += 1
+                journal.log(session, "loop", agent=spec.name, runId=sink.run_id, tool=call.name)
+                sink.add_part(msg, {"type": "notice", "text": f"Loop guard: identical {call.name} call blocked."})
+                output, ok = (f"Doom-loop guard: you called {call.name} with identical arguments {loop_threshold} times "
+                              "in a row. It will not run again. Change your approach, or finish with what you have."), False
+            else:
+                output, ok = await execute_tool(session, sink, msg, spec, ctx, call, output_limit)
+            failures_in_row = 0 if ok else failures_in_row + 1
+            history.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": output})
+
+        if loop_hits >= 2:
+            stopped = "loop"
+            note = sink.add_message("assistant", spec.name, spec.model)
+            sink.add_part(note, {"type": "error", "text": f"{spec.name} stopped: it kept repeating the same tool call."})
+            final_text = "Stopped by the loop guard after repeating the same tool call. Work may be incomplete."
+            break
+        if failures_in_row >= 6 and not nudged:
+            nudged = True
+            history.append({"role": "user", "content": "Several tool calls failed in a row. Stop and think: re-read the "
+                            "relevant files, check paths and exact text, then try a different approach."})
+        if steps >= spec.max_steps and not exhausted:
+            exhausted = True
+            stopped = "budget"
+            history.append({"role": "user", "content": "You have used all your tool calls. Do not call tools any more: "
+                            "write your final answer / report now (what is done, what remains, whether another run is needed)."})
+
+    return AgentOutcome(final_text, steps, in_tok, out_tok, stopped)
+
+
+def make_context(session: Session, agent: str, run: Optional[dict] = None) -> ToolContext:
+    def on_todos(todos: list) -> None:
+        session.data["todos"] = todos
+        session.emit("todos.updated", {"todos": todos})
+        session.touch()
+
+    cfg = load_config()
+    return ToolContext(directory=Path(session.directory), session=session, agent=agent, run=run, on_todos=on_todos,
+                       repo_map_chars=int(cfg["context"].get("repoMapChars") or 6000))

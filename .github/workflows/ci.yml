@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend
+        run: python -m pip install -r requirements.txt
+
+      - name: Backend tests
+        run: python -m pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Smoke test (server starts and serves the UI)
+        shell: bash
+        run: |
+          python server.py --port 4001 > server.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:4001/api/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:4001/ | grep -q "DOINg.AI SuperCode"
+          curl -sf http://127.0.0.1:4001/api/fs/list > /dev/null
