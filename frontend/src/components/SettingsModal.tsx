@@ -4,9 +4,15 @@ import type { AppConfig, Tier } from '../types';
 import { useT, type Strings } from '../i18n';
 import { api } from '../api';
 import { TIERS, cx } from '../util';
+import { McpSettings } from './McpSettings';
+import { ModsManager } from './ModsManager';
+import { PrivacySettings } from './PrivacySettings';
+import { ReverseSettings } from './ReverseSettings';
+import { SkillsManager } from './SkillsManager';
 import { TierChip, TierIcon } from './TierIcon';
 
-type Tab = 'llm' | 'tiers' | 'workspace' | 'bitbucket' | 'flow' | 'context' | 'agent';
+export type SettingsTab = 'llm' | 'tiers' | 'workspace' | 'privacy' | 'bitbucket' | 'flow' | 'context' | 'agent' | 'mcp' | 'skills' | 'mods' | 'reverse';
+type Tab = SettingsTab;
 
 const TIER_DESC: Record<Tier, keyof Strings> = {
   fable: 'tierFable',
@@ -49,10 +55,12 @@ const rulesToText = (rules: AppConfig['permissions']['bashRules']) => rules.map(
 const textToRules = (text: string): AppConfig['permissions']['bashRules'] =>
   text.split('\n').map((l) => /^(.+?)\s*=\s*(allow|ask|deny)\s*$/.exec(l.trim())).filter(Boolean).map((m) => ({ pattern: m![1].trim(), action: m![2] as 'allow' | 'ask' | 'deny' }));
 
-export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfig; onClose: () => void; onSaved: (c: AppConfig) => void }) {
+export function SettingsModal({ initial, onClose, onSaved, initialTab = 'llm', directory = '', onRunCommand }: {
+  initial: AppConfig; onClose: () => void; onSaved: (c: AppConfig) => void; initialTab?: Tab; directory?: string; onRunCommand?: (text: string) => void;
+}) {
   const t = useT();
   const [cfg, setCfg] = useState<AppConfig>(initial);
-  const [tab, setTab] = useState<Tab>('llm');
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [test, setTest] = useState<{ ok: boolean; message: string; models?: string[] } | null>(null);
   const [testing, setTesting] = useState(false);
   const [nexusPath, setNexusPath] = useState(initial.nexusDbPath || '');
@@ -129,11 +137,13 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   };
 
   const models = test?.models || [];
-  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['bitbucket', t.tabBitbucket], ['flow', t.tabFlow], ['context', t.tabContext], ['agent', t.tabAgentCfg]];
+  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['privacy', t.tabPrivacy], ['bitbucket', t.tabBitbucket], ['flow', t.tabFlow],
+    ['context', t.tabContext], ['agent', t.tabAgentCfg], ['mcp', t.tabMcp], ['skills', t.tabSkills], ['mods', t.tabMods], ['reverse', t.tabReverse]];
+  const runAndClose = onRunCommand ? (text: string) => { onRunCommand(text); onClose(); } : undefined;
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div role="dialog" aria-modal aria-label={t.settings} className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-line bg-panel shadow-2xl">
+      <div role="dialog" aria-modal aria-label={t.settings} className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-line bg-panel shadow-2xl">
         <div className="flex items-center border-b border-line px-4 py-3">
           <span className="font-bold">{t.settings}</span>
           <button type="button" onClick={onClose} className="ml-auto text-faint hover:text-fg" aria-label={t.close}><X size={16} /></button>
@@ -252,8 +262,23 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               <Field label={t.workspace} hint={t.workspaceHint}>
                 <input className={inputCls} value={cfg.workspace} onChange={(e) => setCfg((c) => ({ ...c, workspace: e.target.value }))} />
               </Field>
-              {(['edit', 'bash', 'webfetch'] as const).map((k) => (
-                <Field key={k} label={k === 'edit' ? t.permEdit : k === 'bash' ? t.permBash : t.permWeb}>
+              <Field label={t.permissionMode}>
+                <div className="flex flex-wrap gap-1.5">
+                  {(['ask', 'acceptEdits', 'auto'] as const).map((m) => (
+                    <button key={m} type="button" onClick={() => setCfg((c) => ({ ...c, permissionMode: m, autoMode: m === 'auto' }))}
+                      title={{ ask: t.modeAskHint, acceptEdits: t.modeAcceptEditsHint, auto: t.modeAutoHint }[m]}
+                      className={cx('rounded border px-3 py-1 text-[12px]', cfg.permissionMode === m
+                        ? (m === 'auto' ? 'border-warn bg-warn/10 text-warn' : 'border-accent bg-accent/10 text-accent') : 'border-line text-muted hover:text-fg')}>
+                      {{ ask: t.modeAsk, acceptEdits: t.modeAcceptEdits, auto: t.modeAuto }[m]}
+                    </button>
+                  ))}
+                </div>
+                <span className="block text-[11px] text-faint">
+                  {{ ask: t.modeAskHint, acceptEdits: t.modeAcceptEditsHint, auto: t.modeAutoHint }[cfg.permissionMode]} Each session can switch with the chip under the prompt ({t.modeCycle}).
+                </span>
+              </Field>
+              {(['edit', 'bash', 'webfetch', 'open', 'data', 'mcp', 'mods'] as const).map((k) => (
+                <Field key={k} label={{ edit: t.permEdit, bash: t.permBash, webfetch: t.permWeb, open: t.permOpen, data: t.permData, mcp: t.permMcp, mods: t.permMods }[k]}>
                   <div className="flex gap-1.5">
                     {(['allow', 'ask', 'deny'] as const).map((v) => (
                       <button key={v} type="button" onClick={() => setPerm({ [k]: v })}
@@ -264,7 +289,6 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
                   </div>
                 </Field>
               ))}
-              <Toggle label={t.autoModeDefault} checked={cfg.autoMode} onChange={(v) => setCfg((c) => ({ ...c, autoMode: v }))} />
               <Field label={t.projectsRoot}>
                 <input className={inputCls} value={cfg.projectsRoot} onChange={(e) => setCfg((c) => ({ ...c, projectsRoot: e.target.value }))} spellCheck={false} />
               </Field>
@@ -282,8 +306,23 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               <Field label={t.verifyCommands}>
                 <textarea className={`${inputCls} min-h-[64px] text-[12px]`} value={verifyText} onChange={(e) => setVerifyText(e.target.value)} placeholder="npm run build&#10;pytest -q" spellCheck={false} />
               </Field>
+              <div className="space-y-2 rounded-md border border-line p-3">
+                <div className="font-semibold">Terminal and data analysis</div>
+                <Toggle label="Data analysis add-in (Data view, data_* tools for the agents)" checked={cfg.data.enabled}
+                  onChange={(v) => setCfg((c) => ({ ...c, data: { ...c.data, enabled: v } }))}
+                  hint="Database MCP servers (Settings > MCP: any server with a SQL query tool), SQLite / CSV / TSV / JSON / XLSX files of the project." />
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <Num label="Max rows per query" value={cfg.data.maxRows} min={10} max={200000} step={500} onChange={(v) => setCfg((c) => ({ ...c, data: { ...c.data, maxRows: v } }))} />
+                  <Num label="Rows the agent sees" value={cfg.data.previewRows} min={3} max={100} onChange={(v) => setCfg((c) => ({ ...c, data: { ...c.data, previewRows: v } }))}
+                    hint="The rest stays in the app (your data is not all sent to the LLM)." />
+                  <Num label="Shell command timeout (s)" value={cfg.terminal.shellTimeout} min={5} max={3600} onChange={(v) => setCfg((c) => ({ ...c, terminal: { ...c.terminal, shellTimeout: v } }))}
+                    hint="For ! commands; longer ones keep running in the terminal." />
+                </div>
+              </div>
             </>
           )}
+
+          {tab === 'privacy' && <PrivacySettings cfg={cfg} setCfg={setCfg} saved={initial} />}
 
           {tab === 'bitbucket' && (
             <>
@@ -369,6 +408,10 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               </div>
             </>
           )}
+          {tab === 'mcp' && <McpSettings cfg={cfg} setCfg={setCfg} directory={directory || cfg.workspace} />}
+          {tab === 'skills' && <SkillsManager directory={directory || cfg.workspace} onRunCommand={runAndClose} />}
+          {tab === 'mods' && <ModsManager onRunCommand={runAndClose} />}
+          {tab === 'reverse' && <ReverseSettings cfg={cfg} setCfg={setCfg} />}
           <datalist id="llm-models">{models.map((m) => <option key={m} value={m} />)}</datalist>
         </div>
 

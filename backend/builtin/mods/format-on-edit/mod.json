@@ -1,0 +1,11 @@
+{
+  "name": "format-on-edit",
+  "version": "1.0.0",
+  "description": "Formats every file the agent writes with the project's formatter (Prettier, Ruff, Black, gofmt, rustfmt) and tells the agent to re-read it.",
+  "inspiredBy": "Claude Code PostToolUse formatting hooks (Prettier / Black on Edit|Write)",
+  "enabledByDefault": true,
+  "options": {
+    "onlyConfigured": {"default": true, "description": "Only run a formatter the project configures (Prettier config, [tool.ruff] / [tool.black], rustfmt.toml...). gofmt always runs for Go."},
+    "timeout": {"default": 60, "description": "Seconds per formatter run"}
+  }
+}

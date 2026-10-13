@@ -159,11 +159,19 @@ def _spawn(command: str, cwd: str, env: dict, shell_pref: str, has_stdin: bool) 
     )
 
 
+def git_safety_env(base: Optional[dict] = None) -> dict:
+    """Environment overrides (git 2.31+) so that a repository's own .git/config cannot make a harmless
+    ``git status`` run a program through ``core.fsmonitor``."""
+    count = str((base if base is not None else os.environ).get("GIT_CONFIG_COUNT") or "0")
+    n = int(count) if count.isdigit() else 0
+    return {f"GIT_CONFIG_KEY_{n}": "core.fsmonitor", f"GIT_CONFIG_VALUE_{n}": "false", "GIT_CONFIG_COUNT": str(n + 1)}
+
+
 async def run_command(command: str, cwd: str, timeout: float, *, stdin: Optional[bytes] = None,
                       env: Optional[dict] = None, shell: str = "auto") -> tuple[int, str, bool]:
     """Returns (exit code, combined output, timed_out). Cancellation kills the process tree."""
     full_env = {**os.environ, "CI": "1", "GIT_PAGER": "cat", "PAGER": "cat", "NO_COLOR": "1", "FORCE_COLOR": "0",
-                "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+                "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_TERMINAL_PROMPT": "0", **git_safety_env(), **(env or {})}
     proc = _spawn(command, cwd, full_env, shell, stdin is not None)
     chunks: list[bytes] = []
 
@@ -198,3 +206,39 @@ async def run_command(command: str, cwd: str, timeout: float, *, stdin: Optional
         kill_tree(proc)
         raise
     return code, _decode(b"".join(chunks)), timed_out
+
+
+async def run_args(args: list[str], cwd: str, timeout: float, *, env: Optional[dict] = None) -> tuple[int, str, bool]:
+    """Run a program with an argument list - no shell, so file names and branch names are never parsed as
+    shell syntax. Returns (exit code, combined output, timed_out); the process tree is killed on timeout."""
+    if not args:
+        return 127, "empty command", False
+    exe = shutil.which(args[0]) or args[0]  # Windows: npx -> npx.cmd
+    full_env = {**os.environ, "CI": "1", "GIT_PAGER": "cat", "PAGER": "cat", "NO_COLOR": "1", "GIT_TERMINAL_PROMPT": "0",
+                "PYTHONIOENCODING": "utf-8", **git_safety_env(), **(env or {})}
+    kwargs: dict = {}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen([exe, *[str(a) for a in args[1:]]], cwd=cwd, env=full_env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    except (OSError, ValueError) as e:
+        return 127, f"cannot run {args[0]}: {e}", False
+
+    def pump() -> tuple[int, bytes]:
+        assert proc.stdout is not None
+        data = proc.stdout.read()
+        return proc.wait(), data
+
+    worker = asyncio.ensure_future(asyncio.to_thread(pump))
+    try:
+        code, data = await asyncio.wait_for(asyncio.shield(worker), timeout)
+        return code, _decode(data), False
+    except asyncio.TimeoutError:
+        kill_tree(proc)
+        return -1, "", True
+    except asyncio.CancelledError:
+        kill_tree(proc)
+        raise

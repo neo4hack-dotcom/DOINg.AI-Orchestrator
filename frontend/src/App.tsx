@@ -1,21 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, Menu, PanelLeft, PanelRight, X } from 'lucide-react';
+import { ArrowDown, ClipboardList, Database, Menu, PanelLeft, PanelRight, SquareTerminal, X } from 'lucide-react';
 import { api } from './api';
 import { applyEvent } from './sessionReducer';
 import { I18nContext, STRINGS } from './i18n';
-import type { AgentMode, AppConfig, JournalEntry, ServerEvent, Session, SessionSummary } from './types';
+import type { AgentMode, AppConfig, CommandInfo, JournalEntry, ModToast, PermissionMode, ProcInfo, ServerEvent, Session, SessionSummary } from './types';
 import { agentColor, cx, fmtTokens } from './util';
 import { clearAttention, notify, requestNotifyPermission } from './notify';
+import { ActivityView } from './components/ActivityView';
 import { CommandPalette, type PaletteItem } from './components/CommandPalette';
 import { COMMANDS, Composer } from './components/Composer';
+import { DataView } from './components/DataView';
+import { FileViewer } from './components/FileViewer';
 import { Markdown } from './components/Markdown';
+import { McpChip } from './components/McpChip';
+import { ModBand, ModStatusLine, Toasts } from './components/ModUi';
 import { PermissionBar } from './components/PermissionBar';
 import { ProjectDialog } from './components/ProjectDialog';
 import { ProgressBar } from './components/ProgressBar';
 import { QuestionBar } from './components/QuestionBar';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, type SettingsTab } from './components/SettingsModal';
 import { SidePanel, type SideTab } from './components/SidePanel';
 import { Sidebar } from './components/Sidebar';
+import { TerminalPanel } from './components/TerminalPanel';
+import { ToolActions } from './components/ToolPartView';
 import { TodoList } from './components/TodoList';
 import { Transcript } from './components/Transcript';
 
@@ -24,6 +31,16 @@ const INIT_PROMPT =
   '3-7 non-obvious conventions an agent would otherwise get wrong. Keep it under 40 lines. Read the code first.';
 
 const EDIT_TOOLS = new Set(['write', 'edit', 'multiedit', 'apply_patch', 'bash']);
+const MAX_TERM_OUTPUT = 400_000;
+
+/* Live process output: chunks carry their absolute offset, so a chunk already in the snapshot is not shown twice. */
+function appendOutput(p: ProcInfo, offset: number, chunk: string): ProcInfo {
+  const end = offset + chunk.length;
+  if (end <= p.size) return p;
+  const fresh = offset < p.size ? chunk.slice(p.size - offset) : chunk;
+  const output = (p.output || '') + fresh;
+  return { ...p, output: output.length > MAX_TERM_OUTPUT ? output.slice(-MAX_TERM_OUTPUT) : output, size: end };
+}
 
 export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -49,6 +66,25 @@ export default function App() {
   const [liveJournal, setLiveJournal] = useState<JournalEntry[]>([]);
   const [filesVersion, setFilesVersion] = useState(0);
   const [stuck, setStuck] = useState(true);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('llm');
+  const [toasts, setToasts] = useState<ModToast[]>([]);
+  const [commands, setCommands] = useState<CommandInfo[]>([]);
+  const [extVersion, setExtVersion] = useState(0);
+  // terminal, files, preview, data
+  const [procs, setProcs] = useState<ProcInfo[]>([]);
+  const [termOpen, setTermOpen] = useState(false);
+  const [termHeight, setTermHeight] = useState(() => Math.round(Math.min(320, window.innerHeight * 0.35)));
+  const [termCwd, setTermCwd] = useState('');
+  const [termSel, setTermSel] = useState<string | null>(null);
+  const [fileView, setFileView] = useState<{ path: string; line?: number | null; preview?: boolean } | null>(null);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [previewVersion, setPreviewVersion] = useState(0);
+  const [panelWide, setPanelWide] = useState(false);
+  const [dataOpen, setDataOpen] = useState(false);
+  const [dataFile, setDataFile] = useState<string | null>(null);
+  const [dataSignal, setDataSignal] = useState<{ kind: 'dataset' | 'view'; id: string; nonce: number } | null>(null);
+  const [draftMode, setDraftMode] = useState<PermissionMode | null>(null);
   const autoOpenedFor = useRef<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -86,10 +122,22 @@ export default function App() {
   // Open session: full snapshot + live events.
   useEffect(() => {
     setLiveJournal([]);
+    setProcs([]);
+    setTermSel(null);
+    setFileView(null);
+    setPreviewUrl('');
+    setDataOpen(false);
+    setDataFile(null);
+    setDataSignal(null);
     if (!currentId) {
       setSession(null);
       return;
     }
+    const loadTerminal = () => api.terminal(currentId).then((r) => {
+      if (!alive) return;
+      setProcs(r.processes);
+      setTermCwd(r.cwd);
+    }).catch(() => {});
     let alive = true;
     // Events are buffered while a snapshot loads, then only those newer than it are applied:
     // no duplicated stream deltas after a reconnect.
@@ -125,10 +173,57 @@ export default function App() {
       });
     };
     load();
+    loadTerminal();
     let filesTimer: ReturnType<typeof setTimeout> | null = null;
     const stop = api.subscribe(currentId, (e) => {
       if (e.type === 'hello' || e.type === 'session.reload') {
         load();
+        loadTerminal();
+        return;
+      }
+      if (e.type === 'terminal.updated') {
+        const p = e.process;
+        setProcs((list) => {
+          const old = list.find((x) => x.id === p.id);
+          if (!old) return [...list, { ...p, output: '', size: 0 }];
+          if (p.urls.length > old.urls.length) setPreviewVersion((v) => v + 1);
+          return list.map((x) => (x.id === p.id ? { ...x, ...p, output: x.output, size: x.size } : x));
+        });
+        if (p.owner === 'user' && p.kind === 'terminal' && p.status === 'running') setTermOpen(true);
+        if (p.status !== 'running') setFilesVersion((v) => v + 1);
+        return;
+      }
+      if (e.type === 'terminal.output') {
+        setProcs((list) => list.map((x) => (x.id === e.procId ? appendOutput(x, e.offset, e.chunk) : x)));
+        return;
+      }
+      if (e.type === 'terminal.removed') {
+        setProcs((list) => list.filter((x) => x.id !== e.procId));
+        return;
+      }
+      if (e.type === 'terminal.cwd') {
+        setTermCwd(e.cwd);
+        return;
+      }
+      if (e.type === 'files.changed') {
+        setFilesVersion((v) => v + 1);
+        return;
+      }
+      if (e.type === 'ui.show') {
+        if (e.kind === 'url' && e.url) {
+          setPreviewUrl(e.url);
+          setPreviewVersion((v) => v + 1);
+          setSideTab('preview');
+          setPanelWide(true);
+          setPanelOpen(true);
+        } else if (e.kind === 'file' && e.path) {
+          setFileView({ path: e.path, line: e.line, preview: e.preview });
+        }
+        return;
+      }
+      if (e.type === 'data.dataset') setDataSignal({ kind: 'dataset', id: e.dataset.id, nonce: Date.now() });
+      if (e.type === 'data.view') {
+        setDataSignal({ kind: 'view', id: e.datasetId, nonce: Date.now() });
         return;
       }
       if (e.type === 'journal') {
@@ -136,6 +231,14 @@ export default function App() {
         if (e.entry.kind === 'tool' && EDIT_TOOLS.has(e.entry.tool) && !filesTimer) {
           filesTimer = setTimeout(() => { filesTimer = null; setFilesVersion((v) => v + 1); }, 1500);
         }
+        return;
+      }
+      if (e.type === 'mods.toast') {
+        setToasts((list) => [...list.slice(-5), { id: Date.now() + Math.random(), mod: e.mod, text: e.text, kind: e.kind }]);
+        return;
+      }
+      if (e.type === 'mods.changed' || e.type === 'skills.changed') {
+        setExtVersion((v) => v + 1);
         return;
       }
       if (buffer) buffer.push(e);
@@ -160,6 +263,18 @@ export default function App() {
   }, [currentId]);
 
   const busy = Boolean(session?.busy);
+  const directory = session?.directory || config?.workspace || '';
+
+  // Slash commands the server answers: /mod, /reverse, mod commands, skills.
+  useEffect(() => {
+    api.commands(directory).then(setCommands).catch(() => {});
+  }, [directory, extVersion]);
+
+  const openSettings = (tab: SettingsTab = 'llm') => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  };
+  const dismissToast = useCallback((id: number) => setToasts((list) => list.filter((x) => x.id !== id)), []);
   const flow = session?.flow ?? null;
   const runs = session?.runs ?? [];
 
@@ -238,7 +353,8 @@ export default function App() {
 
   const newSession = async (mode: AgentMode = agent): Promise<Session | null> => {
     try {
-      const s = await api.createSession(mode);
+      const s = await api.createSession(mode, '', null, draftMode);
+      setDraftMode(null);
       setSessions((list) => [s, ...list]);
       setSession(s);
       setCurrentId(s.id);
@@ -321,12 +437,43 @@ export default function App() {
     }
   };
 
-  const autoOn = session ? (session.autoMode ?? Boolean(config?.autoMode)) : Boolean(config?.autoMode);
-  const toggleAuto = () => {
-    if (!currentId || !session) return;
-    const value = !autoOn;
-    api.patchSession(currentId, { autoMode: value }).then(() => setSession((s) => (s ? { ...s, autoMode: value } : s))).catch((e) => setError(e.message));
+  const globalMode: PermissionMode = config?.permissionMode || (config?.autoMode ? 'auto' : 'ask');
+  const permMode: PermissionMode = !currentId ? draftMode || globalMode : session?.permissionMode
+    || (session?.autoMode === true ? 'auto' : session?.autoMode === false ? 'ask' : globalMode);
+  // A session's mode is its own (Settings holds the default); before the first session, it applies to the next one.
+  const setPermMode = (mode: PermissionMode) => {
+    if (!currentId) {
+      setDraftMode(mode);
+      return;
+    }
+    const sid = currentId;
+    setSession((s) => (s && s.id === sid ? { ...s, permissionMode: mode, autoMode: mode === 'auto' } : s));
+    api.patchSession(sid, { permissionMode: mode }).catch((e) => setError(e.message));
   };
+  const toggleAuto = () => setPermMode(permMode === 'auto' ? 'ask' : 'auto');
+
+  const runShell = async (command: string) => {
+    setError(null);
+    const sid = await ensureSession(agent);
+    if (!sid) return;
+    stick.current = true;
+    try {
+      await api.shell(sid, command);
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+  const openFile = useCallback((path: string, line?: number | null) => setFileView({ path, line }), []);
+  const openDataset = useCallback((id: string) => {
+    setDataOpen(true);
+    setDataSignal({ kind: 'dataset', id, nonce: Date.now() });
+  }, []);
+  const openDataFile = (path: string) => {
+    setFileView(null);
+    setDataFile(path);
+    setDataOpen(true);
+  };
+  const toolActions = useMemo(() => ({ openFile, openDataset }), [openFile, openDataset]);
 
   const onCommand = async (name: string, arg?: string) => {
     setError(null);
@@ -340,12 +487,20 @@ export default function App() {
     else if (name === 'agents') {
       setPanelOpen(true);
       setSideTab('agents');
-    } else if (name === 'settings') setSettingsOpen(true);
+    } else if (name === 'settings') openSettings('llm');
+    else if (name === 'activity') currentId && setActivityOpen(true);
+    else if (name === 'mcp' || name === 'skills' || name === 'mods') openSettings(name);
     else if (name === 'help') setHelp(true);
     else if (name === 'init') send(INIT_PROMPT, 'build');
     else if (name === 'report') downloadReport();
     else if (name === 'fork') fork();
     else if (name === 'auto') toggleAuto();
+    else if (name === 'terminal') currentId ? setTermOpen(true) : setError('Open a session first.');
+    else if (name === 'files' || name === 'preview') {
+      setSideTab(name);
+      if (name === 'preview') setPanelWide(true);
+      setPanelOpen(true);
+    } else if (name === 'data') currentId ? setDataOpen(true) : setError('Open a session first.');
     else if (name === 'undo' && currentId) {
       try {
         const r = await api.undo(currentId);
@@ -395,6 +550,7 @@ export default function App() {
       if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen((o) => !o); }
       else if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); setNavCollapsed((c) => !c); }
       else if (mod && e.key === '.') { e.preventDefault(); setPanelOpen((o) => !o); }
+      else if (e.ctrlKey && (e.key === '`' || e.code === 'Backquote')) { e.preventDefault(); if (currentId) setTermOpen((o) => !o); }
       else if (e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); setProjectOpen(true); }
     };
     window.addEventListener('keydown', onKey);
@@ -407,13 +563,17 @@ export default function App() {
     }));
     items.push({ id: 'cmd-flow', group: 'cmd', label: '/flow …', hint: t.cmdFlow, run: () => setInject({ text: '/flow ', nonce: Date.now() }) });
     items.push({ id: 'cmd-goal', group: 'cmd', label: '/goal …', hint: t.cmdGoal, run: () => setInject({ text: '/goal ', nonce: Date.now() }) });
-    (['agents', 'plan', 'files', 'git', 'trace'] as SideTab[]).forEach((k) => items.push({
-      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, git: t.tabGit, trace: t.tabTrace }[k],
+    (['agents', 'plan', 'files', 'preview', 'git', 'trace', 'mods'] as SideTab[]).forEach((k) => items.push({
+      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, preview: t.tabPreview, git: t.tabGit, trace: t.tabTrace, mods: t.tabMods }[k],
       run: () => { setSideTab(k); setPanelOpen(true); },
+    }));
+    commands.filter((c) => !COMMANDS.some((x) => x.name === c.name)).forEach((c) => items.push({
+      id: `srv-${c.name}`, group: 'cmd', label: `/${c.name}${c.argumentHint ? ' …' : ''}`, hint: c.description,
+      run: () => (c.argumentHint ? setInject({ text: `/${c.name} `, nonce: Date.now() }) : send(`/${c.name}`, agent)),
     }));
     sessions.forEach((s) => items.push({ id: `ses-${s.id}`, group: 'session', label: s.title, hint: s.directory, run: () => setCurrentId(s.id) }));
     return items;
-  }, [sessions, t]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessions, t, commands]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const runningRuns = runs.filter((r) => r.status === 'running').length;
   const showProgress = Boolean((flow && dismissedFlow !== flow.id) || runningRuns);
@@ -438,7 +598,7 @@ export default function App() {
             onSelect={(id) => { setCurrentId(id); setNavOpen(false); }}
             onNew={() => setProjectOpen(true)}
             onDelete={deleteSession}
-            onSettings={() => setSettingsOpen(true)}
+            onSettings={() => openSettings()}
             config={config}
             llmOk={llmOk}
             lang={lang}
@@ -458,6 +618,26 @@ export default function App() {
             </div>
             {totalTokens > 0 && <span className="hidden shrink-0 text-[11px] tabular-nums text-faint sm:inline">{fmtTokens(totalTokens)} tok</span>}
             <button type="button" onClick={() => setPaletteOpen(true)} className="hidden shrink-0 rounded border border-line px-2 py-1 text-[11px] text-faint hover:text-fg sm:block">Ctrl K</button>
+            {session && (
+              <button type="button" onClick={() => setTermOpen((o) => !o)} title={t.terminalHint} aria-pressed={termOpen}
+                className={cx('inline-flex shrink-0 items-center gap-1.5 rounded border px-2 py-1 text-[12px]', termOpen ? 'border-accent text-accent' : 'border-line text-muted hover:text-fg')}>
+                <SquareTerminal size={13} /> <span className="hidden lg:inline">{t.terminal}</span>
+                {procs.some((p) => p.status === 'running') && <span className="pulse h-1.5 w-1.5 rounded-full bg-ok" />}
+              </button>
+            )}
+            {session && config?.data?.enabled !== false && (
+              <button type="button" onClick={() => setDataOpen(true)} title={t.dataHint}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded border border-line px-2 py-1 text-[12px] text-muted hover:text-fg">
+                <Database size={13} /> <span className="hidden lg:inline">{t.data}</span>
+                {(session.datasets?.length || 0) > 0 && <span className="rounded bg-elev px-1 text-[10px] text-faint">{session.datasets!.length}</span>}
+              </button>
+            )}
+            {session && (
+              <button type="button" onClick={() => setActivityOpen(true)} title={t.activityHint}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded border border-line px-2 py-1 text-[12px] text-muted hover:text-fg">
+                <ClipboardList size={13} /> <span className="hidden sm:inline">{t.activity}</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setPanelOpen((o) => !o)}
@@ -490,12 +670,13 @@ export default function App() {
                       <li><span className="text-faint">▸</span> <Markdown text={t.shortcutsText} /></li>
                     </ul>
                     {llmOk === false && (
-                      <button type="button" onClick={() => setSettingsOpen(true)} className="rounded border border-err/50 px-3 py-1.5 text-err hover:bg-err/10">
+                      <button type="button" onClick={() => openSettings()} className="rounded border border-err/50 px-3 py-1.5 text-err hover:bg-err/10">
                         {t.configureLlm} · {t.llmOffline}
                       </button>
                     )}
                   </div>
                 ) : (
+                  <ToolActions.Provider value={toolActions}>
                   <Transcript
                     messages={session!.messages}
                     flow={flow}
@@ -506,6 +687,7 @@ export default function App() {
                     onEdit={(text) => onCommand('undo').then(() => setInject({ text, nonce: Date.now() }))}
                     onFork={(id) => fork(id)}
                   />
+                  </ToolActions.Provider>
                 )}
               </div>
             </div>
@@ -560,6 +742,7 @@ export default function App() {
                 onReply={(pid, r) => currentId && api.permission(currentId, pid, r).catch((e) => setError(e.message))}
               />
             )}
+            {session && <ModBand ui={session.modUi} onRun={(cmd) => send(cmd, agent)} disabled={busy} />}
             <Composer
               sessionId={currentId}
               agent={agent}
@@ -578,16 +761,39 @@ export default function App() {
               totalTokens={totalTokens}
               compactions={session?.compactions || 0}
               goal={session?.goal}
-              autonomous={autoOn}
-              onToggleAuto={toggleAuto}
+              mode={permMode}
+              onModeChange={setPermMode}
+              onShell={runShell}
               onClearGoal={() => currentId && api.goal(currentId, null).then(() => setSession((s) => (s ? { ...s, goal: null } : s)))}
+              serverCommands={commands}
+              footerExtra={(
+                <McpChip sessionId={currentId} directory={directory} disabled={session?.mcpDisabled || []} version={extVersion}
+                  onChange={(list) => setSession((s) => (s ? { ...s, mcpDisabled: list } : s))} onManage={() => openSettings('mcp')} />
+              )}
             />
+            {session && <ModStatusLine ui={session.modUi} />}
           </div>
+          {termOpen && currentId && (
+            <>
+              <div role="separator" aria-orientation="horizontal" title="Drag to resize" className="h-1 shrink-0 cursor-row-resize bg-line/40 hover:bg-accent/50"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  const move = (ev: MouseEvent) => setTermHeight(Math.max(120, Math.min(window.innerHeight * 0.75, window.innerHeight - ev.clientY)));
+                  const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+                  window.addEventListener('mousemove', move);
+                  window.addEventListener('mouseup', up);
+                }} />
+              <TerminalPanel sessionId={currentId} procs={procs} cwd={termCwd || directory} selected={termSel} onSelect={setTermSel} height={termHeight}
+                onClose={() => setTermOpen(false)}
+                onPreview={(url) => { setPreviewUrl(url); setPreviewVersion((v) => v + 1); setSideTab('preview'); setPanelWide(true); setPanelOpen(true); }} />
+            </>
+          )}
         </main>
 
         {/* savvy-progress agents, plan board, files, trace */}
         {panelOpen && (
-          <div className="fixed inset-y-0 right-0 z-40 w-[min(400px,100vw)] border-l border-line shadow-2xl xl:static xl:z-auto xl:shrink-0 xl:shadow-none">
+          <div className={cx('fixed inset-y-0 right-0 z-40 border-l border-line shadow-2xl xl:static xl:z-auto xl:shrink-0 xl:shadow-none',
+            panelWide && (sideTab === 'preview' || sideTab === 'files') ? 'w-[min(760px,100vw)] xl:w-[min(760px,45vw)]' : 'w-[min(400px,100vw)]')}>
             <SidePanel
               tab={sideTab}
               onTab={setSideTab}
@@ -601,7 +807,13 @@ export default function App() {
               busy={busy}
               filesVersion={filesVersion}
               liveJournal={liveJournal}
-              onOpenSettings={() => setSettingsOpen(true)}
+              onOpenSettings={() => openSettings('bitbucket')}
+              modUi={session?.modUi}
+              onManageMods={() => openSettings('mods')}
+              onOpenFile={openFile}
+              selectedFile={fileView?.path || null}
+              preview={{ url: previewUrl, onUrl: setPreviewUrl, wide: panelWide, onToggleWide: () => setPanelWide((w) => !w), version: previewVersion + filesVersion,
+                localOnly: config?.network?.localOnly !== false }}
             />
           </div>
         )}
@@ -610,10 +822,39 @@ export default function App() {
 
         {paletteOpen && <CommandPalette items={paletteItems} onClose={() => setPaletteOpen(false)} />}
 
+        {activityOpen && currentId && <ActivityView sessionId={currentId} busy={busy} onClose={() => setActivityOpen(false)} />}
+
+        {dataOpen && currentId && session && (
+          <DataView sessionId={currentId} messages={session.messages} busy={busy} signal={dataSignal} initialFile={dataFile}
+            onSend={(text) => send(text, agent === 'flow' ? 'build' : agent)} onClose={() => { setDataOpen(false); setDataFile(null); }}
+            onOpenSettings={() => openSettings('mcp')} />
+        )}
+
+        {fileView && currentId && (
+          <FileViewer sessionId={currentId} path={fileView.path} line={fileView.line} startInPreview={fileView.preview} onClose={() => setFileView(null)}
+            onMention={(p) => { setInject({ text: `@${p} `, nonce: Date.now() }); setFileView(null); }}
+            onOpenData={openDataFile} onDeleted={() => setFilesVersion((v) => v + 1)} />
+        )}
+
+        {/* Approvals stay reachable above the full-screen views. */}
+        {session && (dataOpen || fileView) && (session.pendingPermissions.length > 0 || (session.pendingQuestions?.length || 0) > 0) && (
+          <div className="fixed inset-x-0 bottom-3 z-[60] mx-auto w-[min(720px,calc(100vw-24px))] space-y-2 rounded-lg bg-bg shadow-2xl">
+            <QuestionBar question={session.pendingQuestions?.[0]}
+              onAnswer={(qid, answers) => currentId && api.answer(currentId, qid, answers).catch((e) => setError(e.message))} />
+            <PermissionBar permissions={session.pendingPermissions}
+              onReply={(pid, r) => currentId && api.permission(currentId, pid, r).catch((e) => setError(e.message))} />
+          </div>
+        )}
+
+        <Toasts toasts={toasts} onDismiss={dismissToast} />
+
         {settingsOpen && config && (
           <SettingsModal
             initial={config}
-            onClose={() => setSettingsOpen(false)}
+            initialTab={settingsTab}
+            directory={directory}
+            onRunCommand={currentId ? (text) => send(text, 'build') : undefined}
+            onClose={() => { setSettingsOpen(false); setExtVersion((v) => v + 1); }}
             onSaved={(c) => {
               setConfig(c);
               setLlmOk(null);

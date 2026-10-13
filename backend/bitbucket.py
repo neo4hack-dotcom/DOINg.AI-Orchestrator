@@ -23,7 +23,8 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from .osutil import IS_WINDOWS
+from . import netguard
+from .osutil import IS_WINDOWS, git_safety_env
 
 NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WINDOWS else {}
 
@@ -36,12 +37,20 @@ class BitbucketError(Exception):
 # git
 
 
-async def git(directory: str, *args: str, stdin: Optional[bytes] = None, timeout: int = 180) -> tuple[int, str]:
+async def git(directory: str, *args: str, stdin: Optional[bytes] = None, timeout: int = 180,
+              config: Optional[dict] = None) -> tuple[int, str]:
+    """``config``: extra git settings passed through the environment (secrets never appear in the command line)."""
     def run() -> tuple[int, str]:
-        env = {"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "LC_ALL": "C"}
         import os
+
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "LC_ALL": "C"}
+        env.update(git_safety_env(env))
+        n = int(env["GIT_CONFIG_COUNT"])
+        for i, (k, v) in enumerate((config or {}).items(), start=n):
+            env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
+            env["GIT_CONFIG_COUNT"] = str(i + 1)
         res = subprocess.run(["git", *args], cwd=directory, input=stdin, capture_output=True, timeout=timeout,
-                             env={**os.environ, **env}, **NO_WINDOW)
+                             env=env, **NO_WINDOW)
         return res.returncode, (res.stdout + res.stderr).decode("utf-8", "replace").strip()
 
     try:
@@ -50,6 +59,16 @@ async def git(directory: str, *args: str, stdin: Optional[bytes] = None, timeout
         raise BitbucketError("git is not installed or not on PATH") from e
     except subprocess.TimeoutExpired as e:
         raise BitbucketError(f"git {' '.join(args[:2])} timed out") from e
+
+
+def _remote_host(url: str) -> str:
+    """Host of an https:// or ssh (git@host:path, ssh://) git remote; "" for a local path (/srv/repo.git,
+    C:/repo.git, C:\\repo.git, ./repo, file://) - git reads a drive letter as a path, not as an scp-like host."""
+    url = (url or "").strip()
+    if re.match(r"^[A-Za-z]:[\\/]", url) or url.startswith(("/", "\\", ".", "~", "file:")):
+        return ""
+    m = re.match(r"^[\w+.-]+://(?:[^@/]+@)?([^/:]+)", url) or re.match(r"^(?:[^@/]+@)?([^:/\\]+):", url)
+    return m.group(1) if m else ""
 
 
 def parse_remote(url: str) -> Optional[dict]:
@@ -154,7 +173,7 @@ def _repo_url(t: dict) -> str:
 
 
 def _client(cfg: dict) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=30, verify=bool(cfg.get("verifySsl", True)),
+    return netguard.client(timeout=30, verify=bool(cfg.get("verifySsl", True)),
                              headers={"Accept": "application/json", **_auth_header(cfg)})
 
 
@@ -208,6 +227,10 @@ async def create_pull_request(directory: str, cfg: dict, *, title: str, descript
         raise BitbucketError("This project is not a git repository.")
     if not st.get("remoteUrl"):
         raise BitbucketError(f"No git remote '{remote_name}': add your Bitbucket repository (git remote add {remote_name} <url>).")
+    remote_host = _remote_host(st["remoteUrl"])
+    if netguard.local_only() and remote_host and not netguard.host_is_local(remote_host):
+        raise BitbucketError(f"Local-only mode: the git remote {remote_host} is not on your machine or private network. "
+                             "Turn local-only mode off in Settings > Privacy & security to push there.")
     t = resolve_target(cfg, st)
     target = target or cfg.get("targetBranch") or await default_branch(cfg, t)
     steps: list[str] = []
@@ -236,9 +259,8 @@ async def create_pull_request(directory: str, cfg: dict, *, title: str, descript
 
     push_args = ["push", "-u", remote_name, f"HEAD:refs/heads/{branch}"]
     header = _auth_header(cfg)
-    if header and st["remoteUrl"].startswith("http"):
-        push_args = ["-c", f"http.extraHeader=Authorization: {header['Authorization']}"] + push_args
-    code, out = await git(directory, *push_args, timeout=600)
+    extra = {"http.extraHeader": f"Authorization: {header['Authorization']}"} if header and st["remoteUrl"].startswith("http") else None
+    code, out = await git(directory, *push_args, timeout=600, config=extra)
     if code != 0:
         raise BitbucketError(f"git push failed: {out[-500:]}")
     steps.append("push")

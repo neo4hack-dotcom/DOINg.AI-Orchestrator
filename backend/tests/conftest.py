@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 os.environ["ORCH_DATA_DIR"] = tempfile.mkdtemp(prefix="orch-data-")
+os.environ["ORCH_ALLOWED_HOSTS"] = "test"  # httpx ASGITransport base_url host
 
 import uvicorn  # noqa: E402
 

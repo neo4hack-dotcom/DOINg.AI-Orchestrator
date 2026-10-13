@@ -26,7 +26,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from . import journal, llm, permissions, planner, prompts, repomap
+from . import journal, llm, mods, permissions, planner, prompts, repomap
 from .agent import AgentSpec, execute_tool, make_context, run_agent
 from .config import EFFORT_MAX_STEPS, auto_mode, load_config, orchestrator_model, tier_effort, tier_model
 from .session import MessageSink, Session, new_id, now_ms
@@ -34,7 +34,7 @@ from .snapshot import Snapshots
 from .osutil import read_text, run_command, write_text
 from .tools import EDIT_TOOLS, IGNORED_DIRS, READ_ONLY, make_diff
 
-WORKER_TOOLS = READ_ONLY + EDIT_TOOLS + ["bash", "webfetch", "notes", "step"]
+WORKER_TOOLS = READ_ONLY + EDIT_TOOLS + ["bash", "bash_output", "bash_kill", "webfetch", "notes", "step"]
 PHASES = ("plan", "design", "delegate", "review", "verify", "close")
 EXIT_RE = re.compile(r"\[exit code (-?\d+)\]\s*$")
 
@@ -196,6 +196,7 @@ async def run_worker(
                               auto=auto_mode(cfg, session.data)),
         tools=WORKER_TOOLS if notes_fn else [t for t in WORKER_TOOLS if t != "notes"],
         model=model, max_steps=max_steps, on_usage=on_usage, on_tool=on_tool, pinned=1,
+        extensions="all" if cfg["mcp"].get("inWorkers", True) else "local",
     )
     history = [{"role": "user", "content": prompt}]
     results: list[dict] = []
@@ -219,6 +220,9 @@ async def run_worker(
         run["status"] = "done"
         run["report"] = report or "(the worker wrote no report)"
     except asyncio.CancelledError:
+        from .processes import manager as processes
+
+        processes.kill_run(run["id"])
         run.update(status="failed", report="Aborted.", endedAt=now_ms())
         emit_run(session, run)
         raise
@@ -226,6 +230,9 @@ async def run_worker(
         run["status"] = "failed"
         run["report"] = f"Worker failed: {e}"
         journal.log(session, "error", agent=run["type"], runId=run["id"], error=str(e)[:300])
+    from .processes import manager as processes
+
+    processes.kill_run(run["id"])  # a worker's dev servers / watchers die with it
     run["verify"] = [{k: v for k, v in r.items() if k != "output"} for r in results]
     run["endedAt"] = now_ms()
     emit_run(session, run)
@@ -258,6 +265,8 @@ class FlowEngine:
             self.flow["phase"] = phase
             journal.log(self.session, "phase", phase=phase)
             self.emit()
+            asyncio.ensure_future(mods.notify("flow.phase", self.session, {"phase": phase, "title": self.flow.get("title", ""),
+                                                                            "flowId": self.flow.get("id")}))
 
     def cfg(self) -> dict:
         return load_config()
@@ -265,7 +274,7 @@ class FlowEngine:
     def add_tokens(self, n: int) -> None:
         self.flow["tokens"] = self.flow.get("tokens", 0) + int(n)
 
-    def orch_spec(self, role: str, tools: list[str], steps: int) -> AgentSpec:
+    def orch_spec(self, role: str, tools: list[str], steps: int, extensions: str = "none") -> AgentSpec:
         cfg = self.cfg()
 
         def on_usage(res: llm.ChatResult) -> None:
@@ -275,7 +284,7 @@ class FlowEngine:
             name="savvy-orchestrator",
             system=prompts.system(self.session.directory, cfg["llm"].get("systemPrompt", ""), role,
                                   auto=auto_mode(cfg, self.session.data)),
-            tools=tools, model=orchestrator_model(cfg), max_steps=steps, on_usage=on_usage, pinned=1,
+            tools=tools, model=orchestrator_model(cfg), max_steps=steps, on_usage=on_usage, pinned=1, extensions=extensions,
         )
 
     def notice(self, text: str) -> None:
@@ -367,7 +376,7 @@ class FlowEngine:
     async def plan(self) -> None:
         self.set_phase("plan")
         cfg = self.cfg()
-        spec = self.orch_spec(self._plan_system, READ_ONLY, int(cfg["flow"].get("planSteps") or 8))
+        spec = self.orch_spec(self._plan_system, READ_ONLY, int(cfg["flow"].get("planSteps") or 8), "read")
         out = await run_agent(self.session, spec, self.plan_history, self.sink, make_context(self.session, spec.name))
         plan = extract_json(out.text)
         if not plan or not ("tasks" in plan or "modules" in plan or "questions" in plan):
@@ -560,7 +569,8 @@ class FlowEngine:
         await self.close()
 
     def _grant_plan_commands(self) -> None:
-        """Approving the plan approves the verification commands it lists (no prompt per check)."""
+        """Approving the plan approves the verification commands it lists (no prompt per check) and the edits
+        of the files the tasks own."""
         flow = self.flow
         commands = list(flow.get("verifyCommands", [])) + self.cfg()["verify"].get("commands", [])
         commands += [t.get("verifyCommand", "") for t in flow["tasks"]] + [m.get("verifyCommand", "") for m in flow.get("modules", [])]
@@ -568,6 +578,15 @@ class FlowEngine:
         for cmd in commands:
             for sub in permissions.split_commands(cmd or ""):
                 pattern = glob.escape(sub)
+                if pattern not in grants:
+                    grants.append(pattern)
+        # ... and the edits to the files its tasks own (Ask mode would otherwise confirm each worker edit).
+        for t in flow["tasks"]:
+            for f in t.get("files") or []:
+                f = str(f).strip().lstrip("./").replace("\\", "/")
+                if not f:
+                    continue
+                pattern = f"edit:{f}*" if f.endswith("/") else f"edit:{f}"
                 if pattern not in grants:
                     grants.append(pattern)
 
@@ -751,7 +770,7 @@ class FlowEngine:
                     f"VERIFY: {t['verify'] or '(not specified)'}\n\nAUTOMATED VERIFICATION:\n{check_text}\n\n"
                     f"WORKER REPORT:\n{report}\n\nDIFF OF THE FILES IT CHANGED:\n{changes_diff(self.session.directory, changes)}"
                 )
-                spec = self.orch_spec(prompts.ORCH_REVIEW, READ_ONLY + ["bash", "edit"], int(cfg["flow"].get("reviewSteps") or 8))
+                spec = self.orch_spec(prompts.ORCH_REVIEW, READ_ONLY + ["bash", "edit"], int(cfg["flow"].get("reviewSteps") or 8), "read")
                 history = [{"role": "user", "content": content}]
                 try:
                     out = await run_agent(self.session, spec, history, self.sink, make_context(self.session, spec.name))
@@ -827,7 +846,7 @@ class FlowEngine:
         if not commands or not cfg["flow"].get("autoVerify", True):
             return False
         self.set_phase("verify")
-        spec = self.orch_spec(prompts.orch_fix(), READ_ONLY + ["bash"], 6)
+        spec = self.orch_spec(prompts.orch_fix(), READ_ONLY + ["bash"], 6, "read")
         ctx = make_context(self.session, spec.name)
         results = [await run_check(self.session, self.sink, spec, ctx, c, int(cfg["verify"].get("timeout") or 300)) for c in commands]
         flow["integration"] = [{k: v for k, v in r.items() if k != "output"} for r in results]
@@ -886,6 +905,8 @@ class FlowEngine:
         flow.update(isFinished=True, endedAt=now_ms(), running=0, executing=False)
         journal.log(self.session, "flow_end", done=flow["done"], total=flow["total"], tokens=flow.get("tokens", 0))
         self.emit()
+        files = sorted({f for t in flow["tasks"] for f in (t.get("files") or [])})
+        await mods.notify("turn.complete", self.session, {"agent": "flow", "text": "", "files": files, "runId": None})
         await self._auto_pull_request()
         if self.cfg()["flow"].get("writeReport", True):
             try:

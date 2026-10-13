@@ -18,6 +18,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
+from . import netguard
+
 DeltaFn = Callable[[str, str], Awaitable[None]]  # (kind: "text" | "reasoning", chunk)
 
 
@@ -293,7 +295,7 @@ async def _chat_ollama(cfg, model, messages, tools, on_delta, json_mode, tempera
     splitter = ThinkSplitter()
     calls: list[ToolCall] = []
     p_tok = c_tok = 0
-    async with httpx.AsyncClient(timeout=_timeout(cfg)) as client:
+    async with netguard.client(timeout=_timeout(cfg)) as client:
         async with client.stream("POST", url, json=body) as res:
             if res.status_code >= 400:
                 text = (await res.aread()).decode("utf-8", "replace")
@@ -358,7 +360,7 @@ async def _chat_openai(cfg, model, messages, tools, on_delta, json_mode, tempera
     splitter = ThinkSplitter()
     partial: dict[int, dict] = {}
     p_tok = c_tok = 0
-    async with httpx.AsyncClient(timeout=_timeout(cfg)) as client:
+    async with netguard.client(timeout=_timeout(cfg)) as client:
         async with client.stream("POST", url, json=body, headers=headers) as res:
             if res.status_code >= 400:
                 text = (await res.aread()).decode("utf-8", "replace")
@@ -431,7 +433,7 @@ async def _chat_n8n(cfg, model, messages, tools, on_delta, json_mode, temperatur
         headers["Authorization"] = cfg["apiKey"]
     prompt = "\n\n".join(f"[{m['role'].upper()}]\n{m.get('content') or ''}" for m in messages)
     body = {"prompt": prompt, "messages": messages, "model": model, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    async with httpx.AsyncClient(timeout=_timeout(cfg)) as client:
+    async with netguard.client(timeout=_timeout(cfg)) as client:
         res = await client.post(url, json=body, headers=headers)
     if res.status_code >= 400:
         raise _http_error("n8n", res.status_code, res.text)
@@ -473,6 +475,8 @@ async def chat(
             res = await _chat_n8n(cfg, model, messages, None, on_delta, json_mode, temp)
         else:
             raise LLMError(f"Unsupported provider: {provider}")
+    except netguard.NetworkBlocked as e:
+        raise LLMError(str(e)) from e
     except httpx.ConnectError as e:
         raise LLMError(f"Cannot reach {provider} at {cfg.get('baseUrl')}: {e}", transient=True) from e
     except httpx.TimeoutException as e:
@@ -489,7 +493,7 @@ async def chat(
 async def test_connection(cfg: dict) -> dict:
     provider = cfg.get("provider", "ollama")
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+        async with netguard.client(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
             if provider == "ollama":
                 res = await client.get(_base(cfg.get("baseUrl"), "http://localhost:11434") + "/api/tags")
                 if res.status_code >= 400:

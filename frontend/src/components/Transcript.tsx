@@ -1,28 +1,13 @@
 import { memo, useState } from 'react';
-import { AlertTriangle, Brain, Check, ChevronRight, Copy, GitBranch, Info, Layers, Pencil, RotateCcw, Target } from 'lucide-react';
-import type { CompactionPart, Flow, Message, Part, ToolPart } from '../types';
+import { AlertTriangle, Check, ChevronRight, Copy, GitBranch, Info, Layers, Loader2, Pencil, RotateCcw, Target, TerminalSquare, X } from 'lucide-react';
+import type { CompactionPart, Flow, Message, Part, ShellPart, ToolPart } from '../types';
 import { useT } from '../i18n';
 import { agentColor, cx, fmtTokens } from '../util';
 import { Markdown } from './Markdown';
 import { PlanCard } from './PlanCard';
+import { ReasoningBlock } from './ReasoningBlock';
 import { ReviewCard } from './ReviewCard';
 import { ToolPartView } from './ToolPartView';
-
-function Reasoning({ text, live }: { text: string; live: boolean }) {
-  const t = useT();
-  const [open, setOpen] = useState(false);
-  if (!text.trim()) return null;
-  return (
-    <div className="my-1">
-      <button type="button" onClick={() => setOpen((o) => !o)} className="flex items-center gap-1.5 px-1 text-faint hover:text-muted">
-        <ChevronRight size={12} className={`transition-transform ${open ? 'rotate-90' : ''}`} />
-        <Brain size={12} className={live ? 'pulse' : ''} />
-        <span className="italic">{t.thinking}</span>
-      </button>
-      {open && <div className="ml-6 mt-1 whitespace-pre-wrap border-l border-line pl-3 text-[12px] italic text-faint">{text}</div>}
-    </div>
-  );
-}
 
 function Checkpoint({ part }: { part: CompactionPart }) {
   const t = useT();
@@ -34,6 +19,29 @@ function Checkpoint({ part }: { part: CompactionPart }) {
         <Layers size={12} /> {t.checkpoint}: {fmtTokens(part.before)} → {fmtTokens(part.after)}
       </button>
       {open && <div className="ml-6 mt-1 border-l border-line pl-3 text-[12px] text-muted"><Markdown text={part.text} /></div>}
+    </div>
+  );
+}
+
+/* A command the user ran with !: its output goes to the agent with the next message. */
+function ShellCard({ part, pending }: { part: ShellPart; pending: boolean }) {
+  const t = useT();
+  const lines = part.output.split('\n');
+  const [open, setOpen] = useState(lines.length <= 12);
+  return (
+    <div className="mt-4 rounded-r border-l-2 border-warn bg-panel px-3 py-1.5">
+      <button type="button" onClick={() => setOpen((o) => !o)} className="flex w-full min-w-0 items-center gap-2 text-left" aria-expanded={open}>
+        {part.status === 'running' ? <Loader2 size={12} className="spin shrink-0 text-muted" /> : part.status === 'error' ? <X size={12} className="shrink-0 text-err" />
+          : <Check size={12} className="shrink-0 text-ok" />}
+        <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]"><span className="text-warn">!</span> {part.command}</span>
+        {part.exitCode !== null && part.exitCode !== 0 && <span className="shrink-0 text-[11px] text-err">exit {part.exitCode}</span>}
+        {part.status === 'running' && <span className="shrink-0 text-[11px] text-faint">running in the terminal</span>}
+        <ChevronRight size={12} className={cx('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
+      </button>
+      {open && part.output && (
+        <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-all font-mono text-[12px] text-muted">{part.output}</pre>
+      )}
+      {pending && part.status !== 'running' && <div className="mt-0.5 text-[11px] text-faint">→ {t.shellPending}</div>}
     </div>
   );
 }
@@ -108,7 +116,8 @@ function toBlocks(messages: Message[], busy: boolean, compact?: boolean): Block[
   messages.forEach((m) => {
     if (m.role === 'user') {
       flush(false);
-      if (m.parts.some(visibleText)) blocks.push({ kind: 'user', msg: m });
+      if (m.parts.some((p) => p.type !== 'shell' && visibleText(p))) blocks.push({ kind: 'user', msg: m });
+      m.parts.forEach((p) => p.type === 'shell' && !p.hidden && blocks.push({ kind: 'part', msg: m, part: p }));
       return;
     }
     let toolsHere: ToolPart[] = [];
@@ -154,7 +163,8 @@ export const Transcript = memo(function Transcript({ messages, flow = null, busy
           </div>
         );
       case 'reasoning':
-        return <Reasoning key={p.id} text={p.text} live={busy && m.id === lastMsgId} />;
+        return <ReasoningBlock key={p.id} text={p.text} live={busy && m.id === lastMsgId} startedAt={p.startedAt} endedAt={p.endedAt}
+          agent={m.agent !== 'build' && m.agent !== 'plan' ? m.agent : undefined} />;
       case 'compaction':
         return <Checkpoint key={p.id} part={p} />;
       case 'notice':
@@ -175,6 +185,8 @@ export const Transcript = memo(function Transcript({ messages, flow = null, busy
         return <PlanCard key={p.id} part={p} flow={flow} isLatest={p.id === lastPlanId} onApprove={onApprove || (() => {})} busy={busy} />;
       case 'review':
         return <ReviewCard key={p.id} part={p} onOpenRun={onOpenRun || (() => {})} />;
+      case 'shell':
+        return <ShellCard key={p.id} part={p} pending={!compact && messages.slice(messages.indexOf(m) + 1).every((x) => x.role !== 'user' || x.parts.every((y) => y.type === 'shell'))} />;
       default:
         return null;
     }
@@ -199,10 +211,12 @@ export const Transcript = memo(function Transcript({ messages, flow = null, busy
         if (b.kind === 'user') {
           const text = m.parts.map((p) => (p.type === 'text' ? p.text : '')).join('\n');
           const goal = m.parts.some((p) => p.type === 'text' && p.goal);
+          const command = m.parts.map((p) => (p.type === 'text' ? p.command : undefined)).find(Boolean);
           return (
             <div key={m.id} className={cx('group relative rounded-r border-l-2 bg-panel px-3 py-2', reverted && 'opacity-40', !compact && 'mt-4')}
               style={{ borderColor: agentColor(m.agent) }}>
               {goal && <div className="mb-0.5 flex items-center gap-1 text-[11px] text-accent"><Target size={11} /> {t.goal}</div>}
+              {command && <div className="mb-0.5 flex items-center gap-1 text-[11px] text-accent"><TerminalSquare size={11} /> /{command}</div>}
               <div className={cx('whitespace-pre-wrap break-words', goal && 'text-muted')}>{text}</div>
               {reverted && <div className="mt-1 text-[11px] text-faint">{t.reverted}</div>}
               {!compact && !reverted && !busy && (

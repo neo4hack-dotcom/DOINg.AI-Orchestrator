@@ -105,10 +105,22 @@ def _defs(path: Path, text: str) -> tuple[list[str], set[str]]:
 
 def _files(root: Path) -> list[Path]:
     out = []
+    real = root.resolve()
+    from .config import DATA_DIR
+
+    data = DATA_DIR.resolve()
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS and not d.startswith("."))
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")
+                             and (Path(dirpath) / d).resolve() != data)
         for name in sorted(filenames):
             p = Path(dirpath) / name
+            if p.is_symlink():
+                try:
+                    target = p.resolve()
+                except OSError:
+                    continue
+                if target != real and real not in target.parents:
+                    continue
             if p.suffix in SOURCE_EXT:
                 out.append(p)
                 if len(out) >= MAX_FILES:

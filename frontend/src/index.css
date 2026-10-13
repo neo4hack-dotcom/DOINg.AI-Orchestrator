@@ -108,3 +108,33 @@ button:disabled { cursor: default; }
     animation: none !important;
   }
 }
+
+/* Thinking: shimmering label while the model reasons, fading preview of the live thought */
+@keyframes text-shimmer { 0% { background-position: 120% 0; } 100% { background-position: -120% 0; } }
+.shimmer-text {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 35%, var(--fg) 50%, var(--muted) 65%, var(--muted) 100%);
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: text-shimmer 2.2s linear infinite;
+}
+.fade-top {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 40%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 40%);
+}
+.thought-step::before {
+  content: "";
+  position: absolute;
+  left: -15px;
+  top: 0.55em;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--panel);
+  border: 1.5px solid color-mix(in srgb, var(--accent) 70%, var(--line));
+}
+@keyframes toast-in { from { transform: translateY(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
+.toast-in { animation: toast-in 0.18s ease-out; }
+.md-thought .md { color: var(--muted); }
+.md-thought .md strong { color: var(--fg); }

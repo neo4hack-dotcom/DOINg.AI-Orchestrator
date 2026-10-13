@@ -143,6 +143,21 @@ def test_parse_remote(url, expected):
     assert (r["kind"], r["project"], r["repo"], r["baseUrl"]) == expected
 
 
+@pytest.mark.parametrize("url,host", [
+    ("https://bitbucket.company.com/scm/PROJ/r.git", "bitbucket.company.com"),
+    ("ssh://git@bb.corp:7999/proj/r.git", "bb.corp"),
+    ("git@bitbucket.org:acme/web.git", "bitbucket.org"),
+    ("bb.corp:proj/r.git", "bb.corp"),
+    ("C:/Users/me/remote.git", ""),       # Windows paths are local, not an scp-like host "C"
+    ("C:\\Users\\me\\remote.git", ""),
+    ("/srv/git/remote.git", ""),
+    ("file:///C:/repos/remote.git", ""),
+    ("../remote.git", ""),
+])
+def test_remote_host(url, host):
+    assert bitbucket._remote_host(url) == host
+
+
 def _git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
@@ -215,3 +230,15 @@ async def test_pull_request_existing_and_errors(client, fake_server, bitbucket_s
     BB["existing"] = False
     bad = await client.post(f"/api/sessions/{sid}/pr", json={"title": "x", "branch": "develop", "target": "develop"})
     assert bad.status_code == 400 and "both" in bad.json()["detail"]
+
+
+async def test_no_cross_origin_reads():
+    import httpx
+
+    from backend.main import app
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        evil = await c.options("/api/config", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "PUT"})
+        assert evil.headers.get("access-control-allow-origin") is None
+        dev = await c.options("/api/config", headers={"Origin": "http://localhost:4000", "Access-Control-Request-Method": "PUT"})
+        assert dev.headers.get("access-control-allow-origin") is None  # the dev UI goes through the Vite proxy

@@ -1,17 +1,20 @@
 import { X } from 'lucide-react';
-import type { AgentRun, Flow, JournalEntry } from '../types';
+import type { AgentRun, Flow, JournalEntry, ModUi } from '../types';
 import { useT } from '../i18n';
 import { cx } from '../util';
 import { AgentsPanel } from './AgentsPanel';
-import { FilesPanel } from './FilesPanel';
+import { ExplorerPanel } from './ExplorerPanel';
 import { GitPanel } from './GitPanel';
+import { ModPanels } from './ModUi';
 import { PlanBoard } from './PlanBoard';
+import { PreviewPanel } from './PreviewPanel';
 import { TracePanel } from './TracePanel';
 
-export type SideTab = 'agents' | 'plan' | 'files' | 'git' | 'trace';
+export type SideTab = 'agents' | 'plan' | 'files' | 'preview' | 'git' | 'trace' | 'mods';
 
-/* Right panel: savvy-progress agents, the plan board, changed files and the trace. */
-export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal, onOpenSettings }: {
+/* Right panel: savvy-progress agents, the plan board, the project files, the live preview, git and the trace. */
+export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal, onOpenSettings,
+  modUi, onManageMods, onOpenFile, selectedFile, preview }: {
   tab: SideTab;
   onTab: (t: SideTab) => void;
   onClose: () => void;
@@ -25,6 +28,11 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
   filesVersion: number;
   liveJournal: JournalEntry[];
   onOpenSettings: () => void;
+  modUi?: ModUi;
+  onManageMods: () => void;
+  onOpenFile: (path: string) => void;
+  selectedFile: string | null;
+  preview: { url: string; onUrl: (url: string) => void; wide: boolean; onToggleWide: () => void; version: number; localOnly: boolean };
 }) {
   const t = useT();
   const running = runs.filter((r) => r.status === 'running').length;
@@ -32,8 +40,10 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
     ['agents', t.tabAgents, running || null],
     ['plan', t.tabPlan, flow ? flow.tasks.length : null],
     ['files', t.tabFiles, null],
+    ['preview', t.tabPreview, null],
     ['git', t.tabGit, null],
     ['trace', t.tabTrace, null],
+    ['mods', t.tabMods, Object.keys(modUi?.panels || {}).length || null],
   ];
   return (
     <aside className="flex h-full w-full flex-col bg-bg">
@@ -47,12 +57,14 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
         ))}
         <button type="button" onClick={onClose} className="ml-auto p-1 text-faint hover:text-fg" title={t.close}><X size={15} /></button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className={cx('min-h-0 flex-1', tab === 'preview' || tab === 'files' ? 'overflow-hidden' : 'overflow-y-auto')}>
         {tab === 'agents' && <AgentsPanel runs={runs} flow={flow} focusRunId={focusRunId} onLoadRun={onLoadRun} />}
         {tab === 'plan' && <PlanBoard flow={flow} runs={runs} onOpenRun={onOpenRun} />}
-        {tab === 'files' && <FilesPanel sessionId={sessionId} busy={busy} version={filesVersion} />}
+        {tab === 'files' && <ExplorerPanel sessionId={sessionId} busy={busy} version={filesVersion} onOpenFile={onOpenFile} selected={selectedFile} />}
+        {tab === 'preview' && <PreviewPanel sessionId={sessionId} {...preview} />}
         {tab === 'git' && <GitPanel sessionId={sessionId} busy={busy} version={filesVersion} onOpenSettings={onOpenSettings} />}
         {tab === 'trace' && <TracePanel sessionId={sessionId} live={liveJournal} />}
+        {tab === 'mods' && <ModPanels ui={modUi} onManage={onManageMods} />}
       </div>
     </aside>
   );

@@ -1,0 +1,14 @@
+{
+  "name": "diagnostics",
+  "version": "1.0.0",
+  "description": "LSP-style diagnostics after every edit: Python syntax (+ Ruff errors), JSON, JavaScript (node --check) and TypeScript (tsc) problems are returned to the agent so it fixes them immediately.",
+  "inspiredBy": "OpenCode LSP diagnostics / Claude Code typecheck-after-edit hooks",
+  "enabledByDefault": true,
+  "options": {
+    "python": {"default": true, "description": "Syntax check (+ ruff E9/F63/F7/F82 when ruff is installed)"},
+    "javascript": {"default": true, "description": "node --check for .js/.mjs/.cjs"},
+    "typescript": {"default": true, "description": "tsc --noEmit when the project has tsconfig.json and typescript installed"},
+    "json": {"default": true, "description": "JSON syntax"},
+    "timeout": {"default": 90, "description": "Seconds per checker run"}
+  }
+}

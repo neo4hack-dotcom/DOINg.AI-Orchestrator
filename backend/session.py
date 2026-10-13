@@ -65,6 +65,7 @@ class Session:
             "flowTitle": (d.get("flow") or {}).get("title"),
             "goalActive": bool(d.get("goal") and d["goal"].get("status") == "active"),
             "autoMode": d.get("autoMode"),
+            "permissionMode": d.get("permissionMode"),
         }
 
     def full(self) -> dict:

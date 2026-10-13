@@ -13,19 +13,22 @@ from typing import Any, Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import bitbucket, compaction, journal, llm, prompts
-from .agent import AgentSpec, _manage_context, make_context, run_agent
-from .config import (CONFIG_FILE, ROOT_DIR, auto_mode, load_config, public_config, read_nexus_llm_config,
-                     remember_project, save_config, strip_masked)
+from . import bitbucket, compaction, data_api, journal, llm, mcp_tools, mods, netguard, prompts, report, security, skills, workspace_api
+from .processes import manager as processes
+from .agent import AgentSpec, _manage_context, make_context, run_agent, settle_pending
+from .config import (CONFIG_FILE, PERMISSION_MODES, ROOT_DIR, auto_mode, load_config, mask_server, permission_mode, public_config, read_nexus_llm_config,
+                     remember_project, save_config, strip_masked, unmask_server, update_config)
+from .mcp_client import manager as mcp_manager
+from .mcp_client import project_approval, project_key, project_servers
 from .flow import FlowEngine, extract_json, resume_engine, run_worker
 from .session import MessageSink, Session, new_id, now_ms, store
 from .osutil import posix, read_text, run_command
 from .snapshot import Snapshots
-from .tools import IGNORED_DIRS, READ_ONLY
+from .tools import IGNORED_DIRS, READ_ONLY, ToolContext, ToolDef, ToolError, ToolResult
 
 DIST_DIR = ROOT_DIR / "frontend" / "dist"
 AGENTS = ("build", "plan", "flow")
@@ -71,14 +74,20 @@ def resume_interrupted_flows() -> list[str]:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     first_run_nexus_import()
+    mods.registry.load_all()
     resume_interrupted_flows()
     yield
     for s in store.sessions.values():
         s.save()
+    processes.shutdown()
+    await mcp_manager.shutdown()
 
 
 app = FastAPI(title="DOINg.AI SuperCode", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=security.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(security.GuardMiddleware)
+app.include_router(workspace_api.router)
+app.include_router(data_api.router)
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +110,15 @@ class SessionCreate(BaseModel):
     agent: str = "build"
     directory: str = ""
     autoMode: Optional[bool] = None
+    permissionMode: Optional[str] = None
 
 
 class SessionPatch(BaseModel):
     title: Optional[str] = None
     agent: Optional[str] = None
     autoMode: Optional[bool] = None  # null = follow the global setting
+    permissionMode: Optional[str] = None  # ask | acceptEdits | auto (null = follow the global setting)
+    mcpDisabled: Optional[list[str]] = None  # MCP servers switched off for this session
 
 
 class MessageIn(BaseModel):
@@ -148,6 +160,33 @@ async def get_config() -> dict:
     return public_config(load_config())
 
 
+@app.get("/api/privacy")
+async def privacy() -> dict:
+    """What leaves this machine: every configured destination, plus the protections in force."""
+    cfg = load_config()
+    endpoints = netguard.describe(cfg)
+    host = os.environ.get("ORCH_BIND_HOST", "127.0.0.1")
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    mode = permission_mode(cfg)
+    checks = [
+        {"name": "No telemetry", "ok": True, "detail": "The app sends no analytics, crash reports or update checks."},
+        {"name": "Local-only mode", "ok": netguard.local_only(cfg),
+         "detail": "Every request the app makes is checked: only this machine and private networks are reachable."
+         if netguard.local_only(cfg) else "Off: the LLM, MCP servers and webfetch may reach the internet."},
+        {"name": "Every endpoint is local", "ok": all(e["local"] or e["blocked"] for e in endpoints),
+         "detail": ", ".join(e["name"] for e in endpoints if not e["local"] and not e["blocked"]) or "Nothing configured goes to the internet."},
+        {"name": "Server reachable from this machine only", "ok": loopback or bool(security.token()),
+         "detail": f"Bound to {host}." + ("" if loopback else (" Reachable from the network, protected by an access token." if security.token()
+                                                              else " Reachable from the network WITHOUT a token: restart with --token."))},
+        {"name": "Requests from other websites blocked", "ok": True, "detail": "Host allowlist (DNS rebinding) and Origin checks (CSRF) on every API call."},
+        {"name": "Confirmation before actions", "ok": mode != "auto",
+         "detail": {"ask": "Edits, commands, app launches and data writes ask first.", "acceptEdits": "File edits apply directly; commands still ask.",
+                    "auto": "Auto mode: agents act without asking (deny rules and local-only still apply)."}[mode]},
+    ]
+    return {"localOnly": netguard.local_only(cfg), "allowPackageManagers": bool((cfg.get("network") or {}).get("allowPackageManagers", True)),
+            "endpoints": endpoints, "token": bool(security.token()), "host": host, "checks": checks}
+
+
 @app.put("/api/config")
 async def put_config(body: ConfigUpdate) -> dict:
     data = strip_masked(body.model_dump())
@@ -161,9 +200,13 @@ async def put_config(body: ConfigUpdate) -> dict:
 
 @app.post("/api/config/test")
 async def test_config(body: TestRequest) -> dict:
-    cfg = load_config()["llm"]
+    stored = load_config()["llm"]
+    cfg = stored
     if body.llm:
-        cfg = {**cfg, **strip_masked({"llm": dict(body.llm)})["llm"]}
+        given = strip_masked({"llm": dict(body.llm)})["llm"]
+        cfg = {**stored, **given}
+        if "apiKey" not in given and cfg.get("baseUrl") != stored.get("baseUrl"):
+            cfg["apiKey"] = ""  # the stored key only goes to the stored server
     return await llm.test_connection(cfg)
 
 
@@ -195,14 +238,22 @@ async def list_sessions() -> list:
 
 @app.post("/api/sessions")
 async def create_session(body: SessionCreate) -> dict:
-    directory = str(Path(body.directory or load_config()["workspace"]).expanduser())
+    cfg = load_config()
+    directory = str(Path(body.directory or cfg["workspace"]).expanduser())
+    if not body.directory and not Path(directory).exists() and Path(directory) == Path(cfg.get("projectsRoot") or "").expanduser():
+        Path(directory).mkdir(parents=True, exist_ok=True)  # first run: the default projects folder
     if not Path(directory).is_dir():
         raise HTTPException(400, f"Folder not found: {directory}")
     directory = str(Path(directory).resolve())
     s = store.create(directory, body.agent if body.agent in AGENTS else "build")
     if body.autoMode is not None:
         s.data["autoMode"] = body.autoMode
+        s.data["permissionMode"] = "auto" if body.autoMode else None
+    if body.permissionMode in PERMISSION_MODES:
+        s.data["permissionMode"] = body.permissionMode
+        s.data["autoMode"] = body.permissionMode == "auto"
     remember_project(directory)
+    _mods_session_start(s)
     return s.full()
 
 
@@ -278,7 +329,9 @@ async def create_project(body: ProjectCreate) -> dict:
 
 @app.get("/api/sessions/{sid}")
 async def get_session(sid: str) -> dict:
-    return _get(sid).full()
+    s = _get(sid)
+    _mods_session_start(s)
+    return s.full()
 
 
 @app.patch("/api/sessions/{sid}")
@@ -290,7 +343,18 @@ async def patch_session(sid: str, body: SessionPatch) -> dict:
         s.data["agent"] = body.agent
     if "autoMode" in body.model_fields_set:
         s.data["autoMode"] = body.autoMode
+        s.data["permissionMode"] = "auto" if body.autoMode else None
         journal.log(s, "auto_mode", value=s.data["autoMode"])
+        settle_pending(s, permission_mode(load_config(), s.data))
+    if "permissionMode" in body.model_fields_set:
+        mode = body.permissionMode if body.permissionMode in PERMISSION_MODES else None
+        s.data["permissionMode"] = mode
+        s.data["autoMode"] = None if mode is None else mode == "auto"
+        journal.log(s, "permission_mode", value=mode or "default")
+        settle_pending(s, permission_mode(load_config(), s.data))
+    if body.mcpDisabled is not None:
+        s.data["mcpDisabled"] = sorted({str(x) for x in body.mcpDisabled})
+        journal.log(s, "mcp", disabled=s.data["mcpDisabled"])
     s.touch()
     s.emit("session.updated", {"session": s.summary()})
     return s.summary()
@@ -298,6 +362,12 @@ async def patch_session(sid: str, body: SessionPatch) -> dict:
 
 @app.delete("/api/sessions/{sid}")
 async def delete_session(sid: str) -> dict:
+    processes.kill_session(sid)
+    import shutil
+
+    from .data import DATASETS_DIR
+
+    shutil.rmtree(DATASETS_DIR / sid, ignore_errors=True)
     if not store.delete(sid):
         raise HTTPException(404, "Session not found")
     return {"ok": True}
@@ -500,9 +570,13 @@ async def create_pr(sid: str, body: PullRequestIn) -> dict:
 
 @app.post("/api/bitbucket/test")
 async def bitbucket_test(body: BitbucketTest) -> dict:
-    cfg = load_config()["bitbucket"]
+    stored = load_config()["bitbucket"]
+    cfg = stored
     if body.bitbucket:
-        cfg = {**cfg, **strip_masked({"bitbucket": dict(body.bitbucket)})["bitbucket"]}
+        given = strip_masked({"bitbucket": dict(body.bitbucket)})["bitbucket"]
+        cfg = {**stored, **given}
+        if "token" not in given and (cfg.get("baseUrl") != stored.get("baseUrl") or cfg.get("kind") != stored.get("kind")):
+            cfg["token"] = ""  # the stored token only goes to the stored server
     try:
         return await bitbucket.test(cfg, body.directory or "")
     except (bitbucket.BitbucketError, httpx.HTTPError) as e:
@@ -649,12 +723,12 @@ def _spec_for(s: Session, agent: str) -> AgentSpec:
     auto = auto_mode(cfg, s.data)
     if agent == "plan":
         return AgentSpec("plan", prompts.system(s.directory, custom, prompts.PLAN, auto=auto),
-                         READ_ONLY + ["bash", "todowrite", "todoread", "question", "webfetch"], cfg["llm"]["model"],
-                         permissions={"edit": "deny", "bash": "ask"}, pinned=0)
+                         READ_ONLY + ["bash", "bash_output", "todowrite", "todoread", "question", "webfetch", "show"], cfg["llm"]["model"],
+                         permissions={"edit": "deny", "bash": "ask"}, pinned=0, extensions="read")
     return AgentSpec("build", prompts.system(s.directory, custom, prompts.BUILD, auto=auto),
-                     READ_ONLY + ["write", "edit", "multiedit", "apply_patch", "bash", "webfetch", "todowrite", "todoread",
-                                  "question", "task"],
-                     cfg["llm"]["model"], pinned=0)
+                     READ_ONLY + ["write", "edit", "multiedit", "apply_patch", "bash", "bash_output", "bash_kill", "webfetch",
+                                  "todowrite", "todoread", "question", "task", "show", "open"],
+                     cfg["llm"]["model"], pinned=0, extensions="all")
 
 
 async def _evaluate_goal(s: Session, goal: dict) -> dict:
@@ -689,8 +763,17 @@ async def _chat_turn(s: Session, agent: str, text: str) -> None:
         if user_msg is not None:
             user_msg.update(snapshot=snapshot, historyLen=len(history))
             journal.log(s, "snapshot", label="turn", tree=snapshot)
-    history.append({"role": "user", "content": _attach_mentions(s.directory, text)})
-    await run_agent(s, spec, history, MessageSink(s), ctx)
+    content = _attach_mentions(s.directory, text)
+    pending = s.data.pop("pendingContext", None)  # "!command" results shared by the user
+    if pending:
+        content = f"{pending}\n\n{content}"
+    history.append({"role": "user", "content": content})
+    try:
+        out = await run_agent(s, spec, history, MessageSink(s), ctx)
+    finally:
+        await mods.notify("turn.complete", s, {"agent": agent, "text": "", "files": sorted(ctx.changes), "runId": None})
+    if out.text:
+        s.data["lastAnswer"] = out.text[:4000]
 
     max_cont = int(load_config()["agent"].get("goalMaxContinuations", 8))
     while agent == "build" and (goal := s.data.get("goal")) and goal.get("status") == "active":
@@ -726,12 +809,24 @@ async def post_message(sid: str, body: MessageIn) -> dict:
     agent = body.agent if body.agent in AGENTS else s.data["agent"]
     if text.startswith("/flow"):
         agent, text = "flow", text[5:].strip() or text
+    elif text.startswith("/"):
+        handled = await _slash_command(s, text, agent)
+        if handled is not None:
+            return handled
+    submitted = await mods.dispatch("prompt.submit", s, {"text": text, "agent": agent}, _identity)
+    if isinstance(submitted, dict) and submitted.get("deny"):
+        MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": text}])
+        MessageSink(s).add_message("assistant", "system", parts=[{"type": "notice", "text": f"Blocked by the {submitted.get('mod', '')} mod: {submitted['deny']}"}])
+        return {"ok": False, "blocked": submitted["deny"]}
+    typed = text  # the transcript shows what the user typed; agents get the mods' rewrite
+    if isinstance(submitted, dict) and str(submitted.get("text") or "").strip():
+        text = str(submitted["text"]).strip()
     s.data["agent"] = agent
 
-    MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": text}])
-    journal.log(s, "user", agent=agent, text=text[:2000])
+    MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": typed}])
+    journal.log(s, "user", agent=agent, text=typed[:2000], **({"rewritten": text[:2000]} if text != typed else {}))
     if s.data["title"] == "New session":
-        s.data["title"] = re.sub(r"\s+", " ", text)[:60]
+        s.data["title"] = re.sub(r"\s+", " ", typed)[:60]
         s.emit("session.updated", {"session": s.summary()})
 
     flow = s.data.get("flow")
@@ -747,6 +842,682 @@ async def post_message(sid: str, body: MessageIn) -> dict:
     else:
         _start(s, _chat_turn(s, agent, text))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# slash commands: skills, mod commands, /mod (mod builder), /reverse
+
+
+async def _identity(e: dict) -> dict:
+    return e
+
+
+def _mods_session_start(s: Session) -> None:
+    """Fire the mods' session.start once per session and server process."""
+    if getattr(s, "_mods_started", False):
+        return
+    s._mods_started = True  # type: ignore[attr-defined]
+    asyncio.ensure_future(mods.notify("session.start", s, {"session": {"id": s.id, "directory": s.directory}}))
+
+
+BUILTIN_COMMANDS = [
+    {"name": "flow", "description": "Run a savvy-flow: plan, parallel workers, reviews", "argumentHint": "<request>", "source": "app"},
+    {"name": "mod", "description": "Create or change a mod (hooks, status line, commands) from a description", "argumentHint": "<what the mod should do>", "source": "app"},
+    {"name": "skill-new", "description": "Write a new skill with the agent", "argumentHint": "<what the skill should teach>", "source": "app"},
+    {"name": "reverse", "description": "Reverse engineer a binary, app or website with REA (optional layer)", "argumentHint": "<target> <question>", "source": "app"},
+]
+
+
+def _commands(directory: str) -> list[dict]:
+    out = list(BUILTIN_COMMANDS)
+    names = {c["name"] for c in out}
+    for c in mods.registry.commands().values():
+        if c.name not in names:
+            names.add(c.name)
+            out.append({"name": c.name, "description": c.description, "argumentHint": c.argument_hint, "source": f"mod:{c.mod}"})
+    for sk in skills.active(directory):
+        if sk.user_invocable and sk.name not in names:
+            names.add(sk.name)
+            out.append({"name": sk.name, "description": sk.description[:160], "argumentHint": str(sk.meta.get("argument-hint") or ""),
+                        "source": f"skill:{sk.scope}"})
+    return out
+
+
+@app.get("/api/commands")
+async def list_commands(directory: str = "") -> list:
+    return _commands(directory or load_config()["workspace"])
+
+
+async def _slash_command(s: Session, text: str, agent: str) -> Optional[dict]:
+    m = re.match(r"^/([A-Za-z0-9][\w-]*)(?:\s+(.*))?$", text, re.S)
+    if not m:
+        return None
+    name, args = m.group(1), (m.group(2) or "").strip()
+    sink = MessageSink(s)
+
+    def user_line() -> None:
+        sink.add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": text, "command": name}])
+        journal.log(s, "user", agent=agent, text=text[:2000], command=name)
+        if s.data["title"] == "New session":
+            s.data["title"] = text[:60]
+            s.emit("session.updated", {"session": s.summary()})
+
+    if name == "mod":
+        if not args:
+            raise HTTPException(400, "Describe the mod: /mod <what it should do>")
+        user_line()
+        _start(s, _mod_builder_turn(s, args))
+        return {"ok": True, "command": name}
+    if name == "skill-new":
+        if not args:
+            raise HTTPException(400, "Describe the skill: /skill-new <what it should teach>")
+        user_line()
+        prompt = (f"Create a new user skill for this need: {args}\n\nFollow the skill-creator skill. Write the SKILL.md (and any "
+                  f"reference file) under {skills.USER_DIR.as_posix()}/<name>/ using the write tool, then summarize how to use it.")
+        _start(s, _skill_builder_turn(s, prompt))
+        return {"ok": True, "command": name}
+    if name == "reverse":
+        rev = load_config()["reverse"]
+        user_line()
+        if not (rev.get("enabled") and rev.get("acknowledged")):
+            sink.add_message("assistant", "system", parts=[{"type": "notice", "text": (
+                "The reverse-engineering layer is off. Enable it in Settings > Reverse engineering (lawful use only), then retry.")}])
+            return {"ok": False, "command": name}
+        sk = skills.get("reverse-engineer-anything", s.directory)
+        prompt = (f"Use the reverse-engineer-anything skill (REA MCP server 'rea').\n\n{skills.load_for_agent(sk, None, args)}\n\n"
+                  f"Request: {args or 'Ask me which target and feature to investigate.'}") if sk else args
+        s.data["agent"] = "build"
+        _start(s, _chat_turn(s, "build", prompt))
+        return {"ok": True, "command": name}
+    if name in mods.registry.commands():
+        user_line()
+
+        async def run_cmd() -> None:
+            res = await mods.run_command(s, name, args) or {}
+            if res.get("prompt"):
+                s.data["agent"] = "build"
+                await _chat_turn(s, "build", str(res["prompt"]))
+            else:
+                owner = mods.registry.commands()[name].mod
+                sink.add_message("assistant", f"mod:{owner}", parts=[{"type": "text", "text": str(res.get("text") or "Done.")}])
+
+        _start(s, run_cmd())
+        return {"ok": True, "command": name}
+    expanded = skills.expand_command(text, s.directory)
+    if expanded:
+        sk, prompt = expanded
+        user_line()
+        used = s.data.setdefault("skillsUsed", [])
+        if sk.name not in used:
+            used.append(sk.name)
+        journal.log(s, "skill", name=sk.name, scope=sk.scope)
+        chat_agent = agent if agent in ("build", "plan") else "build"
+        s.data["agent"] = chat_agent
+        _start(s, _chat_turn(s, chat_agent, prompt))
+        return {"ok": True, "command": name, "skill": sk.name}
+    return None
+
+
+MOD_BUILDER = """You are the MOD BUILDER of DOINg.AI SuperCode. You write mods: Python hooks loaded by the app server.
+Your workspace is the user mods folder: create the mod in ./<name>/ (mod.json + mod.py), exactly as the guide below says.
+Builtin mods (read-only, for reference or to copy and adapt under the same name, which then replaces the builtin) are in:
+{builtin}
+When the files are written: call mod_validate(name) and fix every reported error, then call mod_install(name, summary).
+Finish with 2-3 lines telling the user what the mod does and how to use it (commands, options).
+
+# Mod guide
+{guide}"""
+
+
+def _mod_builder_tools() -> dict[str, ToolDef]:
+    async def t_validate(_ctx: ToolContext, args: dict) -> ToolResult:
+        name = str(args.get("name") or "").strip()
+        try:
+            folder = mods.user_folder(name)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        res = mods.registry.validate(folder)  # static: the code does not run before the user approves the install
+        return ToolResult(json.dumps(res, indent=1), f"{name}: {'ok' if res['ok'] else 'errors'}", {"validation": res})
+
+    async def t_install(ctx: ToolContext, args: dict) -> ToolResult:
+        name = str(args.get("name") or "").strip()
+        try:
+            folder = mods.user_folder(name)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        res = mods.registry.validate(folder)
+        if not res["ok"]:
+            raise ToolError(f"The mod is invalid: {res['error']}. Fix it, then install again.")
+
+        def enable(cfg: dict) -> None:
+            cfg["mods"]["disabled"] = [m for m in cfg["mods"]["disabled"] if m != res["name"]]
+            cfg["mods"]["enabled"] = sorted(set(cfg["mods"]["enabled"]) | {res["name"]})
+
+        update_config(enable)
+        mods.registry.load_all()
+        loaded = mods.registry.mods.get(res["name"])
+        if loaded is None or loaded.error:
+            def disable(cfg: dict) -> None:
+                cfg["mods"]["enabled"] = [m for m in cfg["mods"]["enabled"] if m != res["name"]]
+
+            update_config(disable)
+            mods.registry.load_all()
+            raise ToolError(f"The mod failed while loading: {loaded.error if loaded else 'not found'}. Fix it, then install again.")
+        session = ctx.session
+        if session is not None:
+            journal.log(session, "mod", event="installed", mod=res["name"], summary=str(args.get("summary") or "")[:300])
+            session.emit("mods.changed", {"mods": mods.registry.listing()})
+            await mods.notify("session.start", session, {"session": {"id": session.id, "directory": session.directory}})
+        return ToolResult(f"Installed and enabled {res['name']}: events {res['events']}, commands {res['commands']}, tools {res['tools']}.",
+                          f"installed {res['name']}", {"mod": res["name"]})
+
+    S = {"type": "string"}
+    return {
+        "mod_validate": ToolDef("mod_validate", "Load a mod folder in isolation and report its hooks, commands and tools, or its load error.",
+                                {"type": "object", "properties": {"name": S}, "required": ["name"]}, t_validate),
+        "mod_install": ToolDef("mod_install", "Enable a validated mod in the app (the user approves). summary: one line saying what it does.",
+                               {"type": "object", "properties": {"name": S, "summary": S}, "required": ["name", "summary"]}, t_install, "mods"),
+    }
+
+
+async def _mod_builder_turn(s: Session, request: str) -> None:
+    mods.USER_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_config()
+    guide_skill = skills.get("mod-creator", None)
+    system = prompts.system(str(mods.USER_DIR), cfg["llm"].get("systemPrompt", ""),
+                            MOD_BUILDER.format(builtin=mods.BUILTIN_DIR.as_posix(), guide=guide_skill.body() if guide_skill else ""),
+                            auto=auto_mode(cfg, s.data))
+    spec = AgentSpec("mod-builder", system, READ_ONLY + ["write", "edit", "multiedit"], cfg["llm"]["model"], max_steps=30,
+                     pinned=1, extra_tools=_mod_builder_tools())
+    ctx = make_context(s, "mod-builder", directory=str(mods.USER_DIR))
+    ctx.extra_read_roots.append(mods.BUILTIN_DIR)
+    existing = ", ".join(m["name"] for m in mods.registry.listing())
+    history = [{"role": "user", "content": f"Existing mods: {existing or 'none'}.\n\nBuild this mod: {request}"}]
+    journal.log(s, "mod", event="builder", request=request[:500])
+    await run_agent(s, spec, history, MessageSink(s), ctx)
+
+
+async def _skill_builder_turn(s: Session, prompt: str) -> None:
+    skills.USER_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_config()
+    creator = skills.get("skill-creator", None)
+    system = prompts.system(str(skills.USER_DIR), cfg["llm"].get("systemPrompt", ""),
+                            "You write Agent Skills in the user skills folder (your workspace).\n\n" + (creator.body() if creator else ""),
+                            auto=auto_mode(cfg, s.data))
+    spec = AgentSpec("skill-builder", system, READ_ONLY + ["write", "edit", "multiedit"], cfg["llm"]["model"], max_steps=20, pinned=1)
+    ctx = make_context(s, "skill-builder", directory=str(skills.USER_DIR))
+    await run_agent(s, spec, [{"role": "user", "content": prompt}], MessageSink(s), ctx)
+    s.emit("skills.changed", {})
+
+
+# ---------------------------------------------------------------------------
+# MCP servers
+
+
+class McpServerIn(BaseModel):
+    model_config = {"extra": "allow"}
+    renameFrom: Optional[str] = None
+
+
+class McpImport(BaseModel):
+    text: str
+
+
+class McpTest(BaseModel):
+    name: str = "test"
+    server: Optional[dict] = None
+    directory: str = ""
+
+
+class McpApprove(BaseModel):
+    directory: str
+    name: str
+    approved: bool = True
+
+
+def _live(name: str) -> Optional[dict]:
+    for c in mcp_manager.connections.values():
+        if c.name == name:
+            return {"status": c.status, "error": c.error, "tools": len(c.tools), "server": c.server_info}
+    return None
+
+
+@app.get("/api/mcp")
+async def mcp_overview(directory: str = "") -> dict:
+    cfg = load_config()
+    directory = directory or cfg["workspace"]
+    servers = [{"name": n, **mask_server(srv), "source": "user", "live": _live(n)} for n, srv in cfg["mcp"]["servers"].items()]
+    rev = cfg["reverse"]
+    if rev.get("enabled") and rev.get("acknowledged") and mcp_tools.REA_NAME not in cfg["mcp"]["servers"]:
+        servers.append({"name": mcp_tools.REA_NAME, **mask_server(mcp_tools.rea_server(rev)), "source": "reverse", "live": _live(mcp_tools.REA_NAME)})
+    project = []
+    for n, srv in (project_servers(directory).items() if directory else []):
+        state = project_approval(cfg, directory, n, srv)
+        project.append({"name": n, **mask_server(srv), "approved": state == "approved", "approval": state, "live": _live(n)})
+    return {"servers": servers, "project": project, "directory": directory, "presets": mcp_tools.PRESETS,
+            "settings": {k: v for k, v in cfg["mcp"].items() if k not in ("servers", "approvedProjectServers")}}
+
+
+@app.put("/api/mcp/servers/{name}")
+async def mcp_save(name: str, body: McpServerIn) -> dict:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", name.strip())[:40]
+    if not name:
+        raise HTTPException(400, "Server name required")
+    data = body.model_dump(exclude={"renameFrom"})
+    for k in ("name", "live", "source", "approved"):
+        data.pop(k, None)
+    if not (data.get("command") or data.get("url")):
+        raise HTTPException(400, "A server needs a command (stdio) or a url (http / sse)")
+
+    def mutate(cfg: dict) -> None:
+        servers = cfg["mcp"]["servers"]
+        old = servers.pop(body.renameFrom, None) if body.renameFrom and body.renameFrom != name else servers.get(name)
+        servers[name] = unmask_server(data, old)
+
+    cfg = update_config(mutate)
+    return {"name": name, **mask_server(cfg["mcp"]["servers"][name])}
+
+
+@app.delete("/api/mcp/servers/{name}")
+async def mcp_delete(name: str) -> dict:
+    def mutate(cfg: dict) -> None:
+        if name not in cfg["mcp"]["servers"]:
+            raise HTTPException(404, "Server not found")
+        cfg["mcp"]["servers"].pop(name)
+
+    update_config(mutate)
+    for key, conn in list(mcp_manager.connections.items()):
+        if conn.name == name:
+            await conn.close()
+            mcp_manager.connections.pop(key, None)
+    return {"ok": True}
+
+
+@app.post("/api/mcp/import")
+async def mcp_import(body: McpImport) -> dict:
+    try:
+        found = mcp_tools.parse_import(body.text)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    def mutate(cfg: dict) -> None:
+        for n, srv in found.items():
+            cfg["mcp"]["servers"][n] = {"enabled": True, "permission": "ask", "trustReadOnly": True, **srv}
+
+    update_config(mutate)
+    return {"imported": sorted(found)}
+
+
+@app.post("/api/mcp/test")
+async def mcp_test(body: McpTest) -> dict:
+    cfg = load_config()
+    directory = body.directory or cfg["workspace"]
+    stored = mcp_tools.servers_for(cfg, directory).get(body.name) or project_servers(directory).get(body.name)
+    same = bool(stored) and body.server is not None and all(body.server.get(k) == stored.get(k) for k in ("type", "url", "command"))
+    server = unmask_server(dict(body.server), stored if same else None) if body.server else stored
+    if not server:
+        raise HTTPException(404, "Unknown server")
+    return await mcp_manager.test(body.name, server, directory)
+
+
+@app.post("/api/mcp/restart/{name}")
+async def mcp_restart(name: str) -> dict:
+    n = 0
+    for key, conn in list(mcp_manager.connections.items()):
+        if conn.name == name:
+            await conn.close()
+            mcp_manager.connections.pop(key, None)
+            n += 1
+    return {"closed": n}
+
+
+@app.post("/api/mcp/project/approve")
+async def mcp_approve(body: McpApprove) -> dict:
+    servers = project_servers(body.directory)
+    if body.name not in servers:
+        raise HTTPException(404, "This project's .mcp.json has no such server")
+    key = project_key(body.directory, body.name, servers[body.name])
+    prefix = f"{Path(body.directory).resolve()}::{body.name}"
+
+    def mutate(cfg: dict) -> None:
+        approved = {a for a in (cfg["mcp"].get("approvedProjectServers") or []) if not (a == prefix or a.startswith(prefix + "::"))}
+        approved = approved | {key} if body.approved else approved
+        cfg["mcp"]["approvedProjectServers"] = sorted(approved)
+
+    update_config(mutate)
+    return {"ok": True, "approved": body.approved}
+
+
+@app.get("/api/mcp/status")
+async def mcp_status() -> list:
+    return mcp_manager.status()
+
+
+# ---------------------------------------------------------------------------
+# skills
+
+
+class SkillIn(BaseModel):
+    scope: str = "user"
+    name: str
+    content: str
+    files: Optional[dict[str, Optional[str]]] = None
+    renameFrom: Optional[str] = None
+    directory: str = ""
+
+
+class SkillGenerate(BaseModel):
+    request: str
+    existing: str = ""
+
+
+class SkillToggle(BaseModel):
+    enabled: bool
+
+
+class SkillDuplicate(BaseModel):
+    scope: str = "user"
+    newName: Optional[str] = None
+    directory: str = ""
+
+
+class SkillImport(BaseModel):
+    path: str
+    scope: str = "user"
+    directory: str = ""
+
+
+def _skill_dir(directory: str) -> str:
+    return directory or load_config()["workspace"]
+
+
+@app.get("/api/skills")
+async def skills_list(directory: str = "") -> list:
+    return skills.listing(_skill_dir(directory))
+
+
+@app.get("/api/skills/{name}")
+async def skill_get(name: str, directory: str = "") -> dict:
+    sk = skills.get(name, _skill_dir(directory))
+    if not sk:
+        raise HTTPException(404, "Skill not found")
+    cfg = load_config()
+    return {**sk.summary(sk.name not in cfg["skills"]["disabled"], skills.available(sk, cfg)),
+            "content": read_text(sk.path / "SKILL.md"), "files": sk.files()}
+
+
+@app.get("/api/skills/{name}/file")
+async def skill_file(name: str, path: str, directory: str = "") -> PlainTextResponse:
+    sk = skills.get(name, _skill_dir(directory))
+    if not sk:
+        raise HTTPException(404, "Skill not found")
+    try:
+        return PlainTextResponse(skills.read_file(sk, path))
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.put("/api/skills")
+async def skill_save(body: SkillIn) -> dict:
+    try:
+        sk = skills.save(body.scope, body.name, body.content, _skill_dir(body.directory), body.files, body.renameFrom)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return sk.summary()
+
+
+@app.delete("/api/skills/{scope}/{name}")
+async def skill_delete(scope: str, name: str, directory: str = "") -> dict:
+    try:
+        skills.delete(scope, name, _skill_dir(directory))
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True}
+
+
+@app.post("/api/skills/{name}/duplicate")
+async def skill_duplicate(name: str, body: SkillDuplicate) -> dict:
+    try:
+        return skills.duplicate(name, _skill_dir(body.directory), body.scope, body.newName).summary()
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/skills/{name}/toggle")
+async def skill_toggle(name: str, body: SkillToggle) -> dict:
+    def mutate(cfg: dict) -> None:
+        disabled = set(cfg["skills"]["disabled"])
+        cfg["skills"]["disabled"] = sorted(disabled - {name} if body.enabled else disabled | {name})
+
+    update_config(mutate)
+    return {"ok": True}
+
+
+@app.post("/api/skills/generate")
+async def skill_generate(body: SkillGenerate) -> dict:
+    if not body.request.strip():
+        raise HTTPException(400, "Describe the skill")
+    try:
+        content = await skills.generate(body.request, body.existing)
+    except llm.LLMError as e:
+        raise HTTPException(502, f"LLM error: {e}") from e
+    meta, text = skills.parse(content)
+    return {"content": content, "name": meta.get("name") or "", "errors": skills.validate(meta, text)}
+
+
+@app.post("/api/skills/import")
+async def skill_import(body: SkillImport) -> dict:
+    try:
+        return {"imported": [sk.summary() for sk in skills.import_folder(body.path, body.scope, _skill_dir(body.directory))]}
+    except (ValueError, FileNotFoundError, OSError) as e:
+        raise HTTPException(400, str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# mods
+
+
+class ModToggle(BaseModel):
+    enabled: bool
+
+
+class ModOptions(BaseModel):
+    options: dict
+
+
+class ModSource(BaseModel):
+    files: dict[str, str]
+
+
+class ModCreate(BaseModel):
+    name: str
+    description: str = ""
+
+
+def _mods_changed() -> list:
+    listing = mods.registry.listing()
+    for s in store.sessions.values():
+        if s.subscribers:
+            s.emit("mods.changed", {"mods": listing})
+    return listing
+
+
+@app.get("/api/mods")
+async def mods_list() -> list:
+    return mods.registry.listing()
+
+
+@app.post("/api/mods/reload")
+async def mods_reload() -> list:
+    mods.registry.load_all()
+    return _mods_changed()
+
+
+@app.post("/api/mods/{name}/toggle")
+async def mod_toggle(name: str, body: ModToggle) -> list:
+    mods.registry.ensure()
+    if name not in mods.registry.mods:
+        raise HTTPException(404, "Mod not found")
+
+    def mutate(cfg: dict) -> None:
+        dis, en = set(cfg["mods"]["disabled"]), set(cfg["mods"]["enabled"])
+        cfg["mods"]["disabled"] = sorted(dis - {name} if body.enabled else dis | {name})
+        cfg["mods"]["enabled"] = sorted(en | {name} if body.enabled else en - {name})
+
+    update_config(mutate)
+    mods.registry.load_all()  # a user mod's code is loaded only once it is enabled
+    if not body.enabled:  # clear what it showed
+        for s in store.sessions.values():
+            ui = s.data.get("modUi") or {}
+            if any(name in (ui.get(k) or {}) for k in ("status", "band", "panels")):
+                for k in ("status", "band", "panels"):
+                    (ui.get(k) or {}).pop(name, None)
+                s.emit("mods.ui", {"modUi": ui})
+    return _mods_changed()
+
+
+@app.put("/api/mods/{name}/options")
+async def mod_options(name: str, body: ModOptions) -> list:
+    def mutate(cfg: dict) -> None:
+        cfg["mods"]["options"][name] = body.options
+
+    update_config(mutate)
+    return _mods_changed()
+
+
+@app.get("/api/mods/{name}/source")
+async def mod_source(name: str) -> dict:
+    try:
+        return {"files": mods.source(name)}
+    except FileNotFoundError as e:
+        raise HTTPException(404, "Mod not found") from e
+
+
+@app.put("/api/mods/{name}/source")
+async def mod_save_source(name: str, body: ModSource) -> dict:
+    mods.registry.ensure()
+    previous = mods.registry.mods.get(name)
+    was_on = previous is not None and mods.registry.enabled(previous)
+    try:
+        folder = mods.save_files(name, body.files)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    result = mods.registry.validate(folder)
+    if result["ok"] and (was_on or previous is None or previous.scope == "builtin"):
+        # The user saved it from the editor: keep (or put) it on.
+        update_config(lambda cfg: cfg["mods"].update(enabled=sorted(set(cfg["mods"]["enabled"]) | {result["name"]})))
+    mods.registry.load_all()
+    loaded = mods.registry.mods.get(result.get("name") or name)
+    if result["ok"] and loaded is not None and loaded.error:
+        result = {**result, "ok": False, "error": loaded.error}
+    return {"validation": result, "mods": _mods_changed()}
+
+
+@app.post("/api/mods")
+async def mod_create(body: ModCreate) -> dict:
+    name = body.name.strip().lower()
+    try:
+        folder = mods.user_folder(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if folder.exists():
+        raise HTTPException(409, "A mod with this name already exists")
+    desc = body.description.strip().replace('"', "'") or "My mod"
+    mods.save_files(name, {"mod.json": mods.TEMPLATE_JSON % {"name": name, "description": desc},
+                           "mod.py": mods.TEMPLATE_PY % {"description": desc}})
+    update_config(lambda cfg: cfg["mods"].update(enabled=sorted(set(cfg["mods"]["enabled"]) | {name})))
+    mods.registry.load_all()
+    return {"mods": _mods_changed()}
+
+
+@app.delete("/api/mods/{name}")
+async def mod_delete(name: str) -> list:
+    try:
+        mods.delete(name)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e)) from e
+    mods.registry.load_all()
+    return _mods_changed()
+
+
+# ---------------------------------------------------------------------------
+# reverse-engineering layer (REA)
+
+
+def _node_version() -> tuple[str, bool]:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        return "", False
+    try:
+        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", False
+    return out, rea_node_ok(out)
+
+
+def rea_node_ok(version: str) -> bool:
+    """REA needs Node 22.x >= 22.19, 24.x >= 24.11, or 26+."""
+    m = re.match(r"v?(\d+)\.(\d+)", version or "")
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2))
+    return (major == 22 and minor >= 19) or (major == 24 and minor >= 11) or major >= 26
+
+
+@app.get("/api/reverse")
+async def reverse_status() -> dict:
+    import shutil
+
+    cfg = load_config()
+    version, ok = await asyncio.to_thread(_node_version)
+    disclaimer = skills.BUILTIN_DIR / "reverse-engineer-anything" / "DISCLAIMER.md"
+    return {"config": public_config(cfg)["reverse"], "node": {"version": version, "ok": ok}, "npx": bool(shutil.which("npx")),
+            "server": mask_server(mcp_tools.rea_server(cfg["reverse"])), "live": _live(mcp_tools.REA_NAME),
+            "disclaimer": read_text(disclaimer) if disclaimer.is_file() else ""}
+
+
+@app.post("/api/reverse/doctor")
+async def reverse_doctor() -> dict:
+    rev = load_config()["reverse"]
+    if not (rev.get("enabled") and rev.get("acknowledged")):
+        raise HTTPException(400, "Enable the reverse-engineering layer first (Settings > Reverse eng.).")
+    version = str(rev.get("version") or "6.4.0")
+    provider = rev.get("provider") or "auto"
+    cmd = f"npx -y rea-agents@{version} doctor --json" + (f" --provider {provider}" if provider != "auto" else "")
+    code, out, timed_out = await run_command(cmd, str(Path.home()), 600)
+    return {"command": cmd, "exitCode": code, "timedOut": timed_out, "output": out[-20000:]}
+
+
+# ---------------------------------------------------------------------------
+# activity and PDF report
+
+
+@app.get("/api/sessions/{sid}/activity")
+async def session_activity(sid: str) -> dict:
+    return report.collect(_get(sid))
+
+
+@app.get("/api/sessions/{sid}/report.md")
+async def session_report_md(sid: str, reasoning: str = "summary") -> PlainTextResponse:
+    s = _get(sid)
+    return PlainTextResponse(report.markdown(report.collect(s), reasoning=reasoning), media_type="text/markdown",
+                             headers={"Content-Disposition": f'attachment; filename="{report.filename(s, "md")}"'})
+
+
+@app.get("/api/sessions/{sid}/report.pdf")
+async def session_report_pdf(sid: str, reasoning: str = "summary", tools: bool = True) -> Response:
+    s = _get(sid)
+    data = report.collect(s)
+    try:
+        pdf = await asyncio.to_thread(report.pdf, data, reasoning, tools)
+    except report.ReportError as e:
+        raise HTTPException(500, str(e)) from e
+    journal.log(s, "report", format="pdf", bytes=len(pdf))
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{report.filename(s, "pdf")}"'})
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +1549,9 @@ if DIST_DIR.exists():
 
     @app.get("/{path:path}")
     async def spa(path: str):
+        if path.startswith("api/"):
+            raise HTTPException(404, "Not found")
         target = DIST_DIR / path
         if path and target.is_file() and DIST_DIR in target.resolve().parents:
             return FileResponse(target)
-        return FileResponse(DIST_DIR / "index.html")
+        return FileResponse(DIST_DIR / "index.html", headers={"Content-Security-Policy": security.APP_CSP, "Cache-Control": "no-cache"})

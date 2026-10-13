@@ -15,17 +15,19 @@ Long-run hardening (OpenCode / OpenClaude):
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import compaction, journal, llm, permissions
-from .config import auto_mode, load_config
+from . import compaction, extensions, journal, llm, mcp_tools, mods, permissions
+from .config import auto_mode, load_config, permission_mode
 from .session import MessageSink, Session, new_id, now_ms
-from .tools import TOOLS, ToolContext, ToolError, _clip, bound_output
+from .tools import TOOLS, ToolContext, ToolDef, ToolError, _clip, bound_output
 
 UI_OUTPUT_LIMIT = 12_000
 
@@ -49,6 +51,10 @@ class AgentSpec:
     on_usage: Optional[Callable[[llm.ChatResult], None]] = None
     # Called before each tool call (step counters for runs).
     on_tool: Optional[Callable[[llm.ToolCall], None]] = None
+    # MCP tools, skills and mod tools/prompt sections: "all", "local" (no MCP), "read" (read-only agents) or "none".
+    extensions: str = "none"
+    # Tools specific to this agent (e.g. the mod builder's mod_validate / mod_install).
+    extra_tools: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -88,10 +94,12 @@ async def _wait_user(session: Session, registry: str, entry: dict) -> str:
         store.pop(entry["id"], None)
 
 
-async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str) -> str:
+async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str,
+                         grant: Optional[str] = None, note: str = "", forced: bool = False) -> str:
     entry = {
         "id": new_id("perm"), "category": category, "tool": part["tool"], "input": part["input"], "agent": agent,
         "runId": sink.run_id, "messageId": msg["id"], "partId": part["id"], "status": "pending", "createdAt": now_ms(),
+        "note": note, "forced": forced,
     }
     session.data.setdefault("permissionLog", []).append(entry)
     part["permissionId"] = entry["id"]
@@ -99,7 +107,7 @@ async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: d
     entry["status"] = {"once": "allowed", "always": "allowed", "reject": "rejected"}.get(response, "rejected")
     if response == "always":
         grants = session.data.setdefault("alwaysAllow", [])
-        grant = permissions.grant_pattern(part["input"].get("command", "")) if category == "bash" else category
+        grant = grant or (permissions.grant_pattern(part["input"].get("command", "")) if category == "bash" else category)
         if grant not in grants:
             grants.append(grant)
     session.emit("permission.resolved", {"permission": entry})
@@ -107,6 +115,20 @@ async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: d
                 target=str(part["input"].get("command") or part["input"].get("path") or "")[:200])
     session.touch()
     return response
+
+
+def settle_pending(session: Session, mode: str) -> int:
+    """The user switched the session to a more permissive mode: prompts that mode no longer asks are approved
+    (Claude Code behaviour). Prompts every mode asks (network commands, agent-level "ask") stay."""
+    settled = 0
+    for entry in session.data.get("permissionLog", []):
+        fut = session.permissions.get(entry.get("id"))
+        if entry.get("status") != "pending" or not fut or fut.done() or entry.get("forced") or entry.get("note"):
+            continue
+        if mode == "auto" or (mode == "acceptEdits" and entry.get("category") == "edit"):
+            fut.set_result("once")
+            settled += 1
+    return settled
 
 
 async def ask_questions(session: Session, agent: str, run_id: Optional[str], questions: list[dict]) -> list[list[str]]:
@@ -122,20 +144,99 @@ async def ask_questions(session: Session, agent: str, run_id: Optional[str], que
     return answers
 
 
-def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict) -> str:
+EDIT_PATH_KEYS = ("path", "file_path", "filePath")
+
+
+def _edit_paths(session: Session, args: dict) -> list[str]:
+    """Workspace-relative paths an edit tool call touches (apply_patch: every file of the patch)."""
+    raw = [str(args.get(k)) for k in EDIT_PATH_KEYS if args.get(k)]
+    patch = str(args.get("patch") or args.get("patchText") or "")
+    raw += [a or b for a, b in re.findall(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$|^\*\*\* Move to:\s*(.+)$", patch, re.M)]
+    root = Path(session.directory).resolve()
+    out = []
+    for r in raw:
+        p = Path(r.strip())
+        p = (p if p.is_absolute() else root / p).resolve()
+        try:
+            out.append(p.relative_to(root).as_posix())
+        except ValueError:
+            out.append(p.as_posix())
+    return out
+
+
+def _edit_granted(session: Session, args: dict, grants: list) -> bool:
+    """Approving a savvy-flow plan grants edits to the files its tasks own ("edit:<glob>")."""
+    patterns = [g[5:] for g in grants if isinstance(g, str) and g.startswith("edit:")]
+    paths = _edit_paths(session, args)
+    return bool(patterns and paths) and all(any(fnmatch.fnmatch(p, pat) for pat in patterns) for p in paths)
+
+
+def decide(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
+           tool: Optional[ToolDef] = None) -> tuple[str, str]:
+    """(allow | ask | deny, reason) for one tool call.
+
+    Permission modes (Claude Code style): ``ask`` confirms edits, commands, app launches and writes;
+    ``acceptEdits`` applies file edits without asking; ``auto`` asks nothing. Deny rules, the plan
+    agent's read-only restriction and local-only network rules apply in every mode."""
     if not category:
-        return "allow"
-    cfg = load_config()["permissions"]
-    value = spec.permissions.get(category, cfg.get(category, "ask"))
+        return "allow", ""
+    full = load_config()
+    cfg = full["permissions"]
+    mode = permission_mode(full, session.data)
     grants = session.data.get("alwaysAllow", [])
-    if category == "bash":
-        value = permissions.bash_decision(str(args.get("command") or ""), cfg.get("bashRules", []), value, grants)
-    elif value == "ask" and category in grants:
+    override = spec.permissions.get(category)
+    if override == "deny":
+        return "deny", f"{category} actions are not allowed for the {spec.name} agent (read-only)"
+    reason = ""
+    if category == "mcp" and tool is not None:
+        servers = mcp_tools.session_servers(full, session)
+        value = mcp_tools.decision(full, servers, mcp_tools.tool_server(tool, args), mcp_tools.tool_read_only(tool, args), grants)
+        if override == "ask" and value != "deny":
+            value = "ask"
+        if value == "deny":
+            reason = "the MCP server or tool is denied in Settings > MCP"
+    elif category == "bash":
+        command = str(args.get("command") or "")
+        value = permissions.bash_decision(command, cfg.get("bashRules", []), override or cfg.get("bash", "ask"), grants)
+        if value == "deny":
+            return "deny", "a shell deny rule matches this command (Settings > Workspace)"
+        net = full.get("network") or {}
+        kind = permissions.network_kind(command) if net.get("localOnly", True) else None
+        if kind == "network" or (kind == "package" and not net.get("allowPackageManagers", True)):
+            if mode == "auto":
+                return "deny", ("local-only mode: commands that reach the network are never run unattended. Ask the user to run "
+                                "it in the terminal, or to turn local-only mode off in Settings > Privacy & security")
+            return "ask", ("this command reaches the network (local-only mode is on)" if kind == "network"
+                           else "this command installs packages from the network")
+    elif category == "edit":
+        if cfg.get("edit") == "deny":
+            return "deny", "file edits are denied in Settings > Workspace"
+        # An explicit "allow" in Settings acts like a Claude Code allow rule: edits never ask.
+        granted = "edit" in grants or _edit_granted(session, args, grants) or (cfg.get("edit") == "allow" and not override)
+        value = "allow" if (mode in ("acceptEdits", "auto") or granted) else "ask"
+        if override == "ask" and not granted:
+            value = "ask"
+    else:
+        value = override or cfg.get(category, "ask")
+        if value == "deny":
+            return "deny", f"{category} is denied in Settings"
+        if value == "ask" and category in grants:
+            value = "allow"
+    if value == "ask" and mode == "auto" and override != "ask":
         value = "allow"
-    forced_ask = spec.permissions.get(category) == "ask"
-    if value == "ask" and not forced_ask and auto_mode(load_config(), session.data):
-        value = "allow"
-    return value
+    return value, reason
+
+
+def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
+                       tool: Optional[ToolDef] = None) -> str:
+    return decide(session, spec, category, args, tool)[0]
+
+
+def _grant_for(tool: ToolDef, args: dict) -> Optional[str]:
+    if tool.permission == "mcp":
+        server = mcp_tools.tool_server(tool, args)
+        return f"mcp:{server}" if server else "mcp"
+    return None
 
 
 AUTO_ANSWER = ("No user is available (auto mode). Choose the most reasonable option yourself, "
@@ -152,8 +253,10 @@ async def auto_answer(session: Session, agent: str, questions: list[dict]) -> li
 
 
 async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: AgentSpec, ctx: ToolContext,
-                       call: llm.ToolCall, output_limit: int) -> tuple[str, bool]:
-    """Returns (text for the model, ok)."""
+                       call: llm.ToolCall, output_limit: int, registry: Optional[dict[str, ToolDef]] = None) -> tuple[str, bool]:
+    """Returns (text for the model, ok). Mods' ``tool.call`` hooks wrap permission + execution."""
+    if registry is None:
+        registry = {n: TOOLS[n] for n in spec.tools if n in TOOLS}
     part = sink.add_part(msg, {
         "type": "tool", "tool": call.name, "callId": call.id, "input": call.arguments,
         "status": "running", "title": "", "output": "", "metadata": {}, "startedAt": now_ms(),
@@ -161,7 +264,7 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
     started = time.monotonic()
     args = call.arguments
     target = str(args.get("path") or args.get("command") or args.get("pattern") or args.get("url")
-                 or args.get("description") or "")[:200]
+                 or args.get("description") or args.get("tool") or args.get("name") or "")[:200]
 
     def finish(status: str, output: str, title: str = "", metadata: Optional[dict] = None) -> None:
         meta = metadata or {}
@@ -171,47 +274,62 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
         journal.log(session, "tool", agent=spec.name, runId=sink.run_id, tool=call.name, target=target, status=status,
                     ms=int((time.monotonic() - started) * 1000),
                     **({"exitCode": meta["exitCode"]} if "exitCode" in meta else {}),
+                    **({"mcp": meta["mcp"]} if "mcp" in meta else {}),
+                    **({"skill": meta["skill"]} if "skill" in meta else {}),
                     **({"error": output[:300]} if status == "error" else {}))
 
-    tool = TOOLS.get(call.name)
-    if not tool or call.name not in spec.tools:
-        text = f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(spec.tools)}"
-        finish("error", text)
-        return text, False
-
-    decision = resolve_permission(session, spec, tool.permission, args)
-    if decision == "deny":
-        text = (f"Permission denied: this {tool.permission} action is not allowed for the {spec.name} agent "
-                "(deny rule or read-only mode). Use another approach.")
-        finish("error", text)
-        return text, False
-    if decision == "ask":
-        part["status"] = "waiting"
-        sink.update_part(msg, part)
+    async def engine(ev: dict) -> dict:
+        a = ev.get("input") if isinstance(ev.get("input"), dict) else args
+        if a is not args:  # rewritten by a mod
+            part["input"] = a
+            sink.update_part(msg, part)
+        tool = registry.get(call.name)
+        if not tool:
+            return {"ok": False, "output": f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(registry)}"}
+        category = tool.dynamic_permission(a) if tool.dynamic_permission else tool.permission
+        decision, reason = decide(session, spec, category, a, tool)
+        if decision == "deny":
+            return {"ok": False, "output": (f"Permission denied: this {category} action is not allowed for the {spec.name} agent"
+                                            + (f" ({reason})" if reason else " (deny rule or read-only mode)") + ". Use another approach.")}
+        if decision == "ask":
+            part["status"] = "waiting"
+            sink.update_part(msg, part)
+            answer = await ask_permission(session, sink, msg, part, category, spec.name, _grant_for(tool, a), reason,
+                                         spec.permissions.get(category) == "ask")
+            if answer == "reject":
+                return {"ok": False, "display": "Rejected by user",
+                        "output": "The user rejected this tool call. Do not retry it; adapt your approach or ask the user."}
+            part["status"] = "running"
+            sink.update_part(msg, part)
         try:
-            answer = await ask_permission(session, sink, msg, part, tool.permission, spec.name)
+            result = await tool.run(ctx, a)
         except asyncio.CancelledError:
-            finish("error", "Aborted")
             raise
-        if answer == "reject":
-            finish("error", "Rejected by user")
-            return "The user rejected this tool call. Do not retry it; adapt your approach or ask the user.", False
-        part["status"] = "running"
-        sink.update_part(msg, part)
+        except ToolError as e:
+            return {"ok": False, "output": f"Error: {e}", "display": str(e)}
+        except Exception as e:  # noqa: BLE001 - reported to the model, which can recover
+            return {"ok": False, "output": f"Error: {type(e).__name__}: {e}", "display": f"{type(e).__name__}: {e}"}
+        return {"ok": True, "output": result.output, "title": result.title, "metadata": dict(result.metadata)}
 
+    event = {"tool": call.name, "input": args, "agent": spec.name, "runId": sink.run_id}
     try:
-        result = await tool.run(ctx, args)
+        res = await mods.dispatch("tool.call", session, event, engine, tool_ctx=ctx)
     except asyncio.CancelledError:
         finish("error", "Aborted")
         raise
-    except ToolError as e:
-        finish("error", str(e))
-        return f"Error: {e}", False
-    except Exception as e:  # noqa: BLE001 - reported to the model, which can recover
-        finish("error", f"{type(e).__name__}: {e}")
-        return f"Error: {type(e).__name__}: {e}", False
-    model_text, spill = bound_output(result.output, output_limit)
-    finish("done", result.output, result.title, {**result.metadata, **({"spill": spill} if spill else {})})
+    if not isinstance(res, dict):
+        res = {"ok": True, "output": str(res)}
+    if "deny" in res:
+        text = f"Blocked by the {res.get('mod') or 'a'} mod: {res['deny']}"
+        finish("error", text, metadata={"blockedBy": res.get("mod") or "mod"})
+        return text + " Do not retry the same action; adapt your approach.", False
+    output = str(res.get("output", ""))
+    if not res.get("ok", True):
+        finish("error", str(res.get("display") or output))
+        return output, False
+    model_text, spill = bound_output(output, output_limit)
+    meta = dict(res.get("metadata") or {})
+    finish("done", output, str(res.get("title") or ""), {**meta, **({"spill": spill} if spill else {})})
     return model_text, True
 
 
@@ -229,7 +347,10 @@ async def _call_llm(session: Session, sink: MessageSink, spec: AgentSpec, cfg: d
 
         async def on_delta(kind: str, chunk: str) -> None:
             if kind not in parts:
-                parts[kind] = sink.add_part(msg, {"type": kind, "text": ""})
+                parts[kind] = sink.add_part(msg, {"type": kind, "text": "", **({"startedAt": now_ms()} if kind == "reasoning" else {})})
+            if kind == "text" and "reasoning" in parts and not parts["reasoning"].get("endedAt"):
+                parts["reasoning"]["endedAt"] = now_ms()
+                sink.update_part(msg, parts["reasoning"])
             sink.delta(msg, parts[kind], chunk)
 
         try:
@@ -300,6 +421,13 @@ async def run_agent(
         else:
             ctx.ask = lambda qs: ask_questions(session, spec.name, sink.run_id, qs)
 
+    def notify(text: str) -> None:
+        note = sink.add_message("assistant", spec.name, spec.model)
+        sink.add_part(note, {"type": "notice", "text": text})
+
+    extras = await extensions.prepare(session, spec, ctx, notify)
+    registry: dict[str, ToolDef] = {**{n: TOOLS[n] for n in spec.tools if n in TOOLS}, **extras.tools, **spec.extra_tools}
+
     steps = in_tok = out_tok = 0
     final_text = ""
     exhausted = overflowed = nudged = False
@@ -310,9 +438,9 @@ async def run_agent(
     while True:
         await _manage_context(session, sink, spec, cfg, ctx_cfg, history, window)
         mode = _tool_mode(cfg, spec.model)
-        tool_defs = [TOOLS[n] for n in spec.tools if n in TOOLS] if not exhausted else []
+        tool_defs = list(registry.values()) if not exhausted else []
         schemas = [t.schema() for t in tool_defs]
-        system = spec.system
+        system = spec.system + extras.system
         convo = history
         if mode == "prompt":
             if schemas:
@@ -350,7 +478,12 @@ async def run_agent(
         elif text:
             sink.add_part(msg, {"type": "text", "text": text})
         if "reasoning" in parts:
+            parts["reasoning"].setdefault("endedAt", now_ms())
             sink.update_part(msg, parts["reasoning"])
+        elif res.reasoning and res.reasoning.strip():
+            # Some servers return the reasoning in one piece at the end (no stream).
+            sink.add_part(msg, {"type": "reasoning", "text": res.reasoning, "startedAt": msg.get("createdAt") or now_ms(),
+                                "endedAt": now_ms()})
 
         in_tok += res.prompt_tokens
         out_tok += res.completion_tokens
@@ -389,7 +522,7 @@ async def run_agent(
                 output, ok = (f"Doom-loop guard: you called {call.name} with identical arguments {loop_threshold} times "
                               "in a row. It will not run again. Change your approach, or finish with what you have."), False
             else:
-                output, ok = await execute_tool(session, sink, msg, spec, ctx, call, output_limit)
+                output, ok = await execute_tool(session, sink, msg, spec, ctx, call, output_limit, registry)
             failures_in_row = 0 if ok else failures_in_row + 1
             history.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": output})
 
@@ -412,12 +545,12 @@ async def run_agent(
     return AgentOutcome(final_text, steps, in_tok, out_tok, stopped)
 
 
-def make_context(session: Session, agent: str, run: Optional[dict] = None) -> ToolContext:
+def make_context(session: Session, agent: str, run: Optional[dict] = None, directory: Optional[str] = None) -> ToolContext:
     def on_todos(todos: list) -> None:
         session.data["todos"] = todos
         session.emit("todos.updated", {"todos": todos})
         session.touch()
 
     cfg = load_config()
-    return ToolContext(directory=Path(session.directory), session=session, agent=agent, run=run, on_todos=on_todos,
+    return ToolContext(directory=Path(directory or session.directory), session=session, agent=agent, run=run, on_todos=on_todos,
                        repo_map_chars=int(cfg["context"].get("repoMapChars") or 6000))

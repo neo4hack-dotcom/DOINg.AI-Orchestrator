@@ -71,7 +71,11 @@ export function applyEvent(s: Session, e: ServerEvent): Session {
     case 'status':
       return { ...s, busy: e.busy };
     case 'session.updated':
-      return { ...s, title: e.session.title, agent: e.session.agent, busy: e.session.busy };
+      return { ...s, title: e.session.title, agent: e.session.agent, busy: e.session.busy, permissionMode: e.session.permissionMode, autoMode: e.session.autoMode };
+    case 'mods.ui':
+      return { ...s, modUi: e.modUi };
+    case 'data.dataset':
+      return { ...s, datasets: [...(s.datasets || []).filter((d) => d.id !== e.dataset.id), e.dataset] };
     default:
       return s;
   }

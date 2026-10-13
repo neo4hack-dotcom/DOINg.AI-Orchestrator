@@ -1,6 +1,10 @@
-fastapi>=0.115.0
+fastapi>=0.132.0  # strict JSON content-type (CSRF-safe bodies)
 uvicorn[standard]>=0.32.0
 httpx>=0.27.0
+# PDF session reports
+reportlab>=4.0
+# SKILL.md frontmatter (a fallback parser is used without it)
+pyyaml>=6.0
 # tests
 pytest>=8.0
 pytest-asyncio>=0.24

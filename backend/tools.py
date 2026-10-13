@@ -70,6 +70,8 @@ class ToolContext:
     ask: Optional[Callable[[list], Awaitable[list]]] = None
     notes: Optional[Callable[[str, str], list]] = None  # (action, text) -> notes
     repo_map_chars: int = 6000
+    # Folders outside the workspace the agent may read (loaded skills and their reference files).
+    extra_read_roots: list[Path] = field(default_factory=list)
 
 
 def _clip(text: str, limit: int = MAX_OUTPUT) -> str:
@@ -105,7 +107,17 @@ def resolve(ctx: ToolContext, raw: str, *, for_read: bool = False) -> Path:
         spill = SPILL_DIR.resolve()
         if for_read and spill in p.parents:
             return p
+        if for_read and any(r == p or r in p.parents for r in (x.resolve() for x in ctx.extra_read_roots)):
+            return p
         raise ToolError(f"{raw} is outside the workspace {root}")
+    # The app's own data (config with secrets, sessions, mods, skills) is never part of a project, even when
+    # the project folder contains it - unless the agent works inside it on purpose (the mod / skill builders).
+    data = DATA_DIR.resolve()
+    if (p == data or data in p.parents) and not (root == data or data in root.parents):
+        raise ToolError(f"{raw} is the app's private data folder, not part of the project")
+    # .git internals (config, hooks) would let an edit turn into code execution: read-only for the agents.
+    if not for_read and ".git" in p.relative_to(root).parts:
+        raise ToolError(f"{raw} is inside .git: the agents may read it but not modify it (use git commands)")
     return p
 
 
@@ -116,11 +128,26 @@ def rel(ctx: ToolContext, p: Path) -> str:
         return posix(p)
 
 
+def inside(root: Path, p: Path) -> bool:
+    """True when ``p`` (symlinks resolved) is in ``root`` - walkers skip links pointing outside the workspace."""
+    try:
+        r = p.resolve()
+    except OSError:
+        return False
+    return r == root or root in r.parents
+
+
 def _walk(root: Path):
+    real = root.resolve()
+    data = DATA_DIR.resolve()
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS and (not d.startswith(".") or d in (".github",)))
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS and (not d.startswith(".") or d in (".github",))
+                             and (Path(dirpath) / d).resolve() != data)
         for name in sorted(filenames):
-            yield Path(dirpath) / name
+            p = Path(dirpath) / name
+            if p.is_symlink() and not inside(real, p):
+                continue
+            yield p
 
 
 def _is_text(p: Path) -> bool:
@@ -203,7 +230,7 @@ async def t_read(ctx: ToolContext, args: dict) -> ToolResult:
 
 
 async def t_list(ctx: ToolContext, args: dict) -> ToolResult:
-    root = resolve(ctx, args.get("path") or ".")
+    root = resolve(ctx, args.get("path") or ".", for_read=True)
     if not root.is_dir():
         raise ToolError(f"{rel(ctx, root)} is not a directory")
     out: list[str] = []
@@ -218,7 +245,7 @@ async def t_list(ctx: ToolContext, args: dict) -> ToolResult:
 
 async def t_glob(ctx: ToolContext, args: dict) -> ToolResult:
     pattern = args.get("pattern") or "*"
-    root = resolve(ctx, args.get("path") or ".")
+    root = resolve(ctx, args.get("path") or ".", for_read=True)
     matches = []
     for f in _walk(root):
         r = posix(f.relative_to(root))
@@ -288,7 +315,7 @@ async def t_write(ctx: ToolContext, args: dict) -> ToolResult:
         _mark_read(ctx, p)
     diff = make_diff(rel(ctx, p), before or "", content)
     verb = "Updated" if before is not None else "Created"
-    return ToolResult(f"{verb} {rel(ctx, p)} ({len(content.splitlines())} lines)", rel(ctx, p), {"diff": diff, **_diff_stats(diff)})
+    return ToolResult(f"{verb} {rel(ctx, p)} ({len(content.splitlines())} lines)", rel(ctx, p), {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff)})
 
 
 async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult:
@@ -301,7 +328,7 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
                 write_text(p, first.get("new_string") or "")
                 _mark_read(ctx, p)
                 diff = make_diff(rel(ctx, p), "", first.get("new_string") or "")
-                return ToolResult(f"Created {rel(ctx, p)}", rel(ctx, p), {"diff": diff, **_diff_stats(diff)})
+                return ToolResult(f"Created {rel(ctx, p)}", rel(ctx, p), {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff)})
             raise ToolError(f"File not found: {rel(ctx, p)}. Use write to create it.")
         _check_fresh(ctx, p)
         before = read_text(p)
@@ -325,7 +352,7 @@ async def _edit_file(ctx: ToolContext, p: Path, edits: list[dict]) -> ToolResult
     loose = [s for s in strategies if s != "exact"]
     note = f" (matched with {', '.join(sorted(set(loose)))})" if loose else ""
     return ToolResult(f"Edited {rel(ctx, p)}: {len(edits)} change(s){note}", rel(ctx, p),
-                      {"diff": diff, **_diff_stats(diff), "strategies": strategies})
+                      {"diff": diff, "files": [rel(ctx, p)], **_diff_stats(diff), "strategies": strategies})
 
 
 async def t_edit(ctx: ToolContext, args: dict) -> ToolResult:
@@ -406,20 +433,136 @@ async def t_apply_patch(ctx: ToolContext, args: dict) -> ToolResult:
         for lk in locks:
             lk.release()
     diff = "".join(diffs)
-    return ToolResult("Patch applied:\n" + "\n".join(summary), f"{len(planned)} file(s)", {"diff": diff, **_diff_stats(diff)})
+    files = [rel(ctx, dest or p) for kind, p, dest, _b, _a in planned if kind != "delete"]
+    return ToolResult("Patch applied:\n" + "\n".join(summary), f"{len(planned)} file(s)",
+                      {"diff": diff, "files": files, **_diff_stats(diff)})
+
+
+def _reader(ctx: ToolContext) -> str:
+    return f"agent:{ctx.agent}:{(ctx.run or {}).get('id', '')}"
 
 
 async def t_bash(ctx: ToolContext, args: dict) -> ToolResult:
     command = args.get("command") or ""
     if not command.strip():
         raise ToolError("command is required")
+    if args.get("run_in_background"):
+        from .processes import manager
+
+        try:
+            proc = manager.start(ctx.session, command, cwd=str(ctx.directory), owner="agent", kind="background",
+                                 run_id=(ctx.run or {}).get("id"))
+        except RuntimeError as e:
+            raise ToolError(str(e)) from e
+        await manager.wait(proc, 3.0)  # early output or an immediate failure
+        out = await manager.read_new(proc, _reader(ctx))
+        state = f"exited with code {proc.exit_code}" if proc.status != "running" else "running"
+        urls = f"\nLocal URLs: {', '.join(proc.urls)} (use the show tool to preview one)" if proc.urls else ""
+        return ToolResult(f"Background process {proc.id} {state}.{urls}\nFirst output:\n{out.strip() or '(none yet)'}\n\n"
+                          f"Read more with bash_output(id=\"{proc.id}\"), stop it with bash_kill(id=\"{proc.id}\").",
+                          f"{command[:60]} (background)", {"procId": proc.id, "background": True, "urls": proc.urls})
     timeout = min(1800, max(1, int(args.get("timeout") or 120)))
     code, text, timed_out = await run_command(command, str(ctx.directory), timeout, shell=load_config().get("shell", "auto"))
     if timed_out:
-        text += (f"\nCommand timed out after {timeout}s. For servers or watchers, run them in the background "
-                 "(cmd > log 2>&1 &).")
+        text += (f"\nCommand timed out after {timeout}s. For servers or watchers use run_in_background=true, "
+                 "then bash_output to read their logs.")
     text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r\n", "\n").rstrip()  # fewer tokens
     return ToolResult(f"{text or '(no output)'}\n\n[exit code {code}]", command[:80], {"exitCode": code})
+
+
+async def t_bash_output(ctx: ToolContext, args: dict) -> ToolResult:
+    from .processes import manager
+
+    pid = str(args.get("id") or "").strip()
+    proc = manager.get(ctx.session.id, pid) if ctx.session is not None else None
+    if not proc:
+        running = [p.id + " " + p.command[:40] for p in manager.for_session(ctx.session.id)] if ctx.session is not None else []
+        raise ToolError(f"No process {pid}. Processes: {'; '.join(running) or 'none'}")
+    wait = float(args.get("wait") or 0)
+    out = await manager.read_new(proc, _reader(ctx), wait=wait)
+    if args.get("filter"):
+        try:
+            rx = re.compile(str(args["filter"]))
+            out = "\n".join(l for l in out.splitlines() if rx.search(l))
+        except re.error as e:
+            raise ToolError(f"invalid filter regex: {e}") from e
+    state = "running" if proc.status == "running" else f"{proc.status}, exit code {proc.exit_code}"
+    urls = f"\nLocal URLs: {', '.join(proc.urls)}" if proc.urls else ""
+    return ToolResult(f"[{proc.id} {state}]{urls}\n{out.strip() or '(no new output)'}", f"{proc.id} {state}",
+                      {"procId": proc.id, "status": proc.status, "exitCode": proc.exit_code})
+
+
+async def t_bash_kill(ctx: ToolContext, args: dict) -> ToolResult:
+    from .processes import manager
+
+    pid = str(args.get("id") or "").strip()
+    proc = manager.get(ctx.session.id, pid) if ctx.session is not None else None
+    if not proc:
+        raise ToolError(f"No process {pid}")
+    if proc.owner != "agent":
+        raise ToolError("This process was started by the user from the terminal: ask the user to stop it.")
+    manager.kill(proc)
+    await manager.wait(proc, 5)
+    return ToolResult(f"Stopped {proc.id} ({proc.command[:80]}).", f"stopped {proc.id}", {"procId": proc.id})
+
+
+async def t_show(ctx: ToolContext, args: dict) -> ToolResult:
+    """Open a file (at a line) or a local URL in the app for the user: editor, preview or data view."""
+    session = ctx.session
+    url = str(args.get("url") or "").strip()
+    if url:
+        from . import netguard
+
+        if not netguard.url_is_local(url):
+            raise ToolError("Only local URLs (localhost, private network) can be shown in the preview.")
+        if session is not None:
+            session.emit("ui.show", {"kind": "url", "url": url, "agent": ctx.agent})
+        return ToolResult(f"Showing {url} in the preview panel.", url, {"url": url})
+    p = resolve(ctx, str(args.get("path") or ""), for_read=True)
+    if not p.exists():
+        raise ToolError(f"Not found: {rel(ctx, p)}")
+    line = int(args.get("line") or 0) or None
+    if session is not None:
+        session.emit("ui.show", {"kind": "file", "path": rel(ctx, p), "line": line, "preview": bool(args.get("preview")),
+                                 "agent": ctx.agent})
+    return ToolResult(f"Opened {rel(ctx, p)}{f' at line {line}' if line else ''} for the user.", rel(ctx, p), {"path": rel(ctx, p)})
+
+
+def open_external(target: str) -> None:
+    """Open a file, folder or URL with the system's default application."""
+    import subprocess
+    import sys
+
+    if os.name == "nt":
+        os.startfile(target)  # type: ignore[attr-defined]  # noqa: S606 - user-approved
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+async def t_open(ctx: ToolContext, args: dict) -> ToolResult:
+    target = str(args.get("target") or args.get("path") or args.get("url") or "").strip()
+    if not target:
+        raise ToolError("target is required (a workspace path or a URL)")
+    if re.match(r"^https?://", target):
+        from . import netguard
+
+        if netguard.local_only() and not netguard.url_is_local(target):
+            raise ToolError("Local-only mode: only local URLs can be opened.")
+        dest = target
+    else:
+        p = resolve(ctx, target, for_read=True)
+        if not p.exists():
+            raise ToolError(f"Not found: {rel(ctx, p)}")
+        if p.is_file() and p.suffix.lower() in (".exe", ".bat", ".cmd", ".com", ".msi", ".ps1", ".sh", ".app", ".scr", ".vbs", ".jar"):
+            raise ToolError("Opening executables is not allowed: run them with bash instead (it goes through the shell rules).")
+        dest = str(p)
+    try:
+        await asyncio.to_thread(open_external, dest)
+    except OSError as e:
+        raise ToolError(f"Cannot open {target}: {e}") from e
+    return ToolResult(f"Opened {target} with the default application.", target[:80], {"target": target})
 
 
 # ---------------------------------------------------------------------------
@@ -467,12 +610,21 @@ def html_to_text(raw: str) -> str:
 async def t_webfetch(ctx: ToolContext, args: dict) -> ToolResult:
     import httpx
 
+    from . import netguard
+
     url = str(args.get("url") or "").strip()
     if not re.match(r"^https?://", url):
         raise ToolError("url must start with http:// or https://")
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if netguard.host_is_local(parts.hostname or "") and str(parts.port or "") == os.environ.get("ORCH_BIND_PORT", "4001"):
+        raise ToolError("webfetch cannot call DOINg.AI SuperCode's own API.")
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with netguard.client(timeout=30, follow_redirects=True, max_redirects=5) as client:
             res = await client.get(url, headers={"User-Agent": "DOINg.AI-SuperCode/1.0"})
+    except netguard.NetworkBlocked as e:
+        raise ToolError(str(e)) from e
     except httpx.HTTPError as e:
         raise ToolError(f"Fetch failed: {e}") from e
     ctype = res.headers.get("content-type", "")
@@ -568,8 +720,12 @@ class ToolDef:
     description: str
     parameters: dict
     run: ToolFn
-    permission: Optional[str] = None  # "edit" | "bash" | "webfetch" | None
+    permission: Optional[str] = None  # "edit" | "bash" | "webfetch" | "mcp" | "mods" | None
     mutates: bool = False
+    # Extension data: MCP server / tool, read-only hint, owning mod or skill.
+    meta: dict = field(default_factory=dict)
+    # Category computed from the arguments (e.g. a SQL write vs a read), overriding ``permission``.
+    dynamic_permission: Optional[Callable[[dict], Optional[str]]] = None
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
@@ -604,8 +760,20 @@ TOOLS: dict[str, ToolDef] = {
                 _obj({"path": S, "edits": {"type": "array", "items": EDIT_ITEM}}, ["path", "edits"]), t_multiedit, "edit", True),
         ToolDef("apply_patch", "Create, update, move or delete several files in one call. Format:\n" + editing.PATCH_HELP,
                 _obj({"patch": S}, ["patch"]), t_apply_patch, "edit", True),
-        ToolDef("bash", "Run a shell command in the workspace (build, tests, git...). Returns output and exit code. Run servers in the background.",
-                _obj({"command": S, "timeout": {**I, "description": "Seconds, default 120"}}, ["command"]), t_bash, "bash", True),
+        ToolDef("bash", "Run a shell command in the workspace (build, tests, git...). Returns output and exit code. For servers, watchers "
+                "and anything long-running set run_in_background=true, then read its output with bash_output.",
+                _obj({"command": S, "timeout": {**I, "description": "Seconds, default 120"},
+                      "run_in_background": {"type": "boolean", "description": "Start and return at once (dev servers, watchers)"}}, ["command"]),
+                t_bash, "bash", True),
+        ToolDef("bash_output", "Read the new output of a background process started with bash run_in_background (status, exit code, local URLs). "
+                "wait: seconds to wait for new output (e.g. until a server is ready). filter: regex keeping matching lines.",
+                _obj({"id": S, "wait": I, "filter": S}, ["id"]), t_bash_output),
+        ToolDef("bash_kill", "Stop a background process you started.", _obj({"id": S}, ["id"]), t_bash_kill),
+        ToolDef("show", "Show the user something in the app: a workspace file in the editor (path, optional line; preview=true renders "
+                "HTML / Markdown / images / CSV), or a local URL in the preview panel (url, e.g. the dev server you started).",
+                _obj({"path": S, "line": I, "preview": {"type": "boolean"}, "url": S}, []), t_show),
+        ToolDef("open", "Open a workspace file or folder, or a local URL, with the system's default application (e.g. a spreadsheet in Excel, "
+                "a page in the browser). Executables are refused.", _obj({"target": S}, ["target"]), t_open, "open"),
         ToolDef("webfetch", "Fetch a URL (documentation, API reference) and return it as text.",
                 _obj({"url": S}, ["url"]), t_webfetch, "webfetch"),
         ToolDef("todowrite", "Replace the session todo list. Use it to plan multi-step work and mark progress.",

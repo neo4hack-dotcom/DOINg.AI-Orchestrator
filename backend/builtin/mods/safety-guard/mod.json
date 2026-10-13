@@ -1,0 +1,13 @@
+{
+  "name": "safety-guard",
+  "version": "1.0.0",
+  "description": "Blocks destructive shell commands (recursive deletes of root/home, curl | sh, force push, DROP DATABASE, disk writes...) and edits to secrets (.env, keys, .git). Active in auto mode too.",
+  "inspiredBy": "Claude Code PreToolUse safety hooks (dangerous-command blocker, protected files)",
+  "enabledByDefault": true,
+  "options": {
+    "protectedPaths": {"default": [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", ".git/*", ".ssh/*"], "description": "Glob patterns the agent may not write, edit or delete"},
+    "allowedPaths": {"default": [".env.example", ".env.sample", ".env.template"], "description": "Exceptions to protectedPaths"},
+    "allowPatterns": {"default": [], "description": "Regular expressions of commands to always allow (checked first)"},
+    "extraBlocked": {"default": [], "description": "Additional regular expressions of commands to block"}
+  }
+}
