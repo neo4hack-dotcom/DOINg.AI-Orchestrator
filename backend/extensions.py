@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import mcp_tools, mods, skills
+from . import data, mcp_tools, mods, skills
 from .config import load_config
 from .tools import ToolDef
 
@@ -46,6 +46,12 @@ async def prepare(session, spec, ctx, notify) -> Extras:
             out.system += bundle.system
         except Exception as e:  # noqa: BLE001 - MCP must never break a turn
             notify(f"MCP unavailable for this turn: {e}")
+
+    # Data analysis add-in: SQL on database MCP servers and local data files, shared datasets.
+    # Only for the chat agents (build / plan): workers and the orchestrator keep a smaller prompt.
+    if cfg.get("data", {}).get("enabled", True) and spec.name in ("build", "plan"):
+        out.tools.update(data.tool_defs(session, read_only))
+        out.system += data.system_section()
 
     # Mods: prompt sections, and their tools for agents that may act.
     out.system += await mods.compose(session, spec.name, read_only)

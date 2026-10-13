@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response, Streami
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import bitbucket, compaction, journal, llm, mcp_tools, mods, prompts, report, security, skills, workspace_api
+from . import bitbucket, compaction, data_api, journal, llm, mcp_tools, mods, prompts, report, security, skills, workspace_api
 from .processes import manager as processes
 from .agent import AgentSpec, _manage_context, make_context, run_agent
 from .config import (CONFIG_FILE, PERMISSION_MODES, ROOT_DIR, auto_mode, load_config, mask_server, permission_mode, public_config, read_nexus_llm_config,
@@ -87,6 +87,7 @@ app = FastAPI(title="DOINg.AI SuperCode", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=security.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(security.GuardMiddleware)
 app.include_router(workspace_api.router)
+app.include_router(data_api.router)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +334,11 @@ async def patch_session(sid: str, body: SessionPatch) -> dict:
 @app.delete("/api/sessions/{sid}")
 async def delete_session(sid: str) -> dict:
     processes.kill_session(sid)
+    import shutil
+
+    from .data import DATASETS_DIR
+
+    shutil.rmtree(DATASETS_DIR / sid, ignore_errors=True)
     if not store.delete(sid):
         raise HTTPException(404, "Session not found")
     return {"ok": True}

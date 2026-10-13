@@ -102,6 +102,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mods": "ask",
         # Opening a file, folder or URL with the system's default application.
         "open": "ask",
+        # SQL statements that change data (INSERT, UPDATE, DELETE, DDL) run by the agents (data add-in).
+        "data": "ask",
         # Evaluated per sub-command (split on && ; | ||). deny wins, then allow; else the category value.
         "bashRules": [
             {"pattern": "ls*", "action": "allow"},
@@ -242,7 +244,7 @@ def _sanitize(cfg: dict) -> dict:
         if tier.get("effort") not in EFFORTS:
             tier["effort"] = DEFAULT_CONFIG["tiers"][name]["effort"]
         tier["model"] = str(tier.get("model") or "")
-    for key in ("edit", "bash", "webfetch", "mcp", "mods", "open"):
+    for key in ("edit", "bash", "webfetch", "mcp", "mods", "open", "data"):
         if cfg["permissions"].get(key) not in PERMISSION_VALUES:
             cfg["permissions"][key] = DEFAULT_CONFIG["permissions"][key]
     rules = cfg["permissions"].get("bashRules")
