@@ -8,6 +8,11 @@
 - **Projects anywhere**: create a new project folder or open an existing one with a built-in folder browser (drives on Windows, recent projects).
 - **Bitbucket pull requests** from the app: branch, commit, push and PR to **Bitbucket Server / Data Center** (enterprise, self-hosted) or **Bitbucket Cloud**, manually (`/pr`) or automatically at the end of a flow.
 - **Full traceability**: a journal of every tool call and decision, a Markdown report, `docs/PLAN.md` and `docs/FLOW_REPORT.md`, git snapshots with undo.
+- **Readable thinking + Activity view + PDF report**: the model's reasoning streams in a live "Thinking…" card and folds into a "Thought for 12s · 4 steps" timeline; the **Activity** view gathers every reasoning step, the savvy plan, every test / verification and every action, and exports a structured, professional **PDF** (or Markdown) report in English.
+- **MCP servers**: connect any Model Context Protocol server (stdio, Streamable HTTP, SSE) and use its tools in every session, with tool search for large servers, per-server permissions and project `.mcp.json` approval.
+- **Skills**: create, edit, generate with AI, import and run Agent Skills (`SKILL.md` folders, Claude Code compatible); the agents load them on demand.
+- **Mods**: Claude Code-style hooks on the agent's events, created by asking (`/mod <description>`), with the **top 5** built in: status line, format-on-edit, safety guard, diagnostics, commit commands.
+- **Reverse engineering layer** (optional): [REA](https://github.com/morluto/rea)'s MCP server and skill, gated behind a responsible-use acknowledgement.
 - **Windows, macOS and Linux**: tested on all three in CI.
 - **100% local**: no telemetry. Providers: **Ollama**, **OpenAI-compatible** servers (LM Studio, vLLM, llama.cpp, LocalAI…) and **n8n** webhooks.
 
@@ -108,11 +113,74 @@ Then **Test Bitbucket**. From a session, open the **Git** tab (or `/pr`):
 | `/pr` | Bitbucket pull request |
 | `/undo` | undo the last turn (files **and** conversation, via git snapshot) |
 | `/auto` · `/compact` · `/fork` · `/report` | auto mode · summarize the context · branch the session · download the report |
+| `/activity` | every reasoning step, the plan, tests and actions; **Export PDF** |
+| `/<skill-name> <args>` | run a skill (e.g. `/code-review src/`, `/systematic-debugging <error>`) |
+| `/mod <description>` · `/skill-new <need>` | the agent writes and installs a mod · writes a skill |
+| `/commit` · `/clean-gone` | commit everything with an AI-written message · delete branches whose remote is gone (commit-commands mod) |
+| `/reverse <target> <question>` | reverse engineering with REA (optional layer) |
+| `/mcp` · `/skills` · `/mods` | open their settings |
 | `/build`, `/plan`, `/agents`, `/settings`, `/init`, `/help` | — |
 
 `/init` creates or updates `AGENTS.md`; that file (or `CLAUDE.md`) is injected into every agent's prompt.
 
 **Permissions** (when auto mode is off): file edits allowed, shell on request (*once* / *always*, remembered per command pattern like `npm test*` / *reject*). **Shell rules** (`git status* = allow`, `git push* = deny`…) apply per sub-command (`&&`, `;`, `|`). Approving a plan pre-approves its verification commands.
+
+## Thinking, activity and the PDF report
+
+- **Thinking**: while a model reasons (Ollama `thinking`, OpenAI-compatible `reasoning_content`, or `<think>` tags), a card shows a shimmering *Thinking…* header, a timer and a rolling preview of the thought. When the answer starts it folds into a pill - *Thought for 12s · 4 steps* - that opens a step-by-step timeline (paragraphs, numbered lines or sentence groups).
+- **Activity view** (header button or `/activity`): overview with key figures (span, requests, reasoning steps, actions, files, checks passed, tokens) and the outcome; a filterable **timeline** of everything; every **reasoning** step of the main agent and of each savvy worker; the **savvy plan** (modules, tasks with tier, size, status, rounds, duration, defects, worker reports, spec, design); **validation** (verify commands, test / build / lint runs with PASS/FAIL, orchestrator reviews); **actions** (stats per tool + full log); **files** changed with +/-; **extensions** (MCP calls, skills used, mod events, blocked actions, permission decisions, questions, pull requests, issues). It refreshes live while the agents work.
+- **Export PDF**: an A4 report in English - cover page with key figures, table of contents and PDF bookmarks, executive summary, requests, plan, execution, validation, reasoning (summary, full or none), action log, files, extensions and decisions, issues - with running header and footer. Markdown export too. Generated locally with reportlab (system fonts, bundled fallback).
+
+## MCP servers
+
+Settings → **MCP** (or `/mcp`, or the **MCP** chip above the prompt):
+
+- **Add** a server (stdio command, Streamable HTTP or legacy SSE; env, headers, timeout), **import** a Claude Desktop / Claude Code (`{"mcpServers": …}`) or VS Code (`{"servers": …}`) JSON, or start from a **preset** (Context7 docs, filesystem, git, fetch, memory, sequential thinking, Playwright, GitHub, Atlassian, PostgreSQL).
+- **Test** shows the server, its tools (read-only ones marked) and lets you switch tools off one by one.
+- **Project servers** declared in a repository's `.mcp.json` never start until you approve them.
+- In sessions, tools appear as `mcp__<server>__<tool>`. Beyond **16** tools (configurable) the agents get `mcp_search` + `mcp_call` instead of every schema - tool search keeps a local model's prompt small and stable. Server instructions are summarized in the system prompt; `mcp_resources` lists / reads resources.
+- **Best practices built in**: servers start lazily and restart after a crash; per-server permission (*ask* / *allow* / *deny*), read-only tools trusted, "always" grants per server, auto mode honoured, deny always wins; the plan agent and the orchestrator only see read-only tools; results are normalized to text (images summarized) and long outputs spill to a file; secrets in env / headers are masked in the UI; switch servers per session from the chip.
+- The client speaks the protocol directly (JSON-RPC 2.0, protocol 2025-06-18): it is tested against the official Python SDK over stdio and Streamable HTTP, and works on Windows (`npx.cmd`, process trees).
+
+## Skills
+
+Settings → **Skills** (or `/skills`). A skill is a folder with a `SKILL.md` - YAML frontmatter (`name`, `description`, optional `argument-hint`, `allowed-tools`, `disable-model-invocation`, `user-invocable`) and Markdown instructions - plus optional reference files and scripts: the [Agent Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview) format used by Claude Code.
+
+- **Progressive disclosure**: the agents only see each skill's name and description; they load the body with the `skill` tool when a task matches, then read reference files as needed. Run one yourself with `/<skill-name> <arguments>` (`$ARGUMENTS` is substituted).
+- **Where**: personal skills in `data/skills`, project skills in `<project>/.supercode/skills` (also read: `.claude/skills`, `.agents/skills`), built-in skills shipped with the app. A project skill overrides a personal one with the same name.
+- **Create**: blank template, **Draft with AI** from a description (or improve the open skill), `/skill-new <need>` to let the agent research and write it, or **import** a folder. Edit `SKILL.md` and reference files in the app; duplicate a built-in skill to customize it; switch any skill off.
+- **Built in**: `skill-creator`, `mod-creator`, `code-review`, `test-driven-development`, `systematic-debugging` (and `reverse-engineer-anything` with the reverse layer).
+
+## Mods
+
+Mods extend the agent like Claude Code mods. A mod is a folder with `mod.json` and a `mod.py` exposing `register(on, mod)`; every hook is `(ctx, e, next)`: call `next(e)` to continue (or rewrite the event), return `{"deny": reason}` to block.
+
+| Event | Use it to |
+| --- | --- |
+| `tool.call` (matcher on the tool) | block or rewrite a call before it runs, post-process the result the model sees |
+| `prompt.submit` · `prompt.compose` | rewrite the user's prompt · add system-prompt sections |
+| `turn.complete` · `flow.phase` · `session.start` | react to turns, savvy-flow phases, sessions |
+| `command.run` | answer a slash command declared with `mod.command()` |
+
+`ctx` gives the status line (`ctx.status`), a band above the prompt with buttons (`ctx.band`), a section in the side panel's **Mods** tab (`ctx.panel`), toasts, session `state` and global `store`, `await ctx.run(cmd)`, `ctx.read`, `await ctx.llm(prompt)`, options and the journal. Mods can also give the agent tools (`mod.tool`). A failing mod is isolated, logged and reported, never fatal.
+
+- **Create by asking**: `/mod block edits under migrations/ and count them in the status line` - the mod builder writes the mod in `data/mods`, validates it, and installs it after your approval (permission *mods*). Or edit / create mods in Settings → **Mods** (source editor, options, logs, reload).
+- **Top 5 built in** (the most used Claude Code plugins / hooks that make sense here, all on by default):
+  1. **statusline** - branch and uncommitted files, model, context %, tokens, last turn time (ccstatusline-style);
+  2. **format-on-edit** - Prettier / Ruff / Black / gofmt / rustfmt on every file the agent writes (only formatters the project configures);
+  3. **safety-guard** - blocks `rm -rf /`, `curl | sh`, force push, `DROP DATABASE`, disk writes, publishing… and edits to `.env`, keys and `.git` - even in auto mode;
+  4. **diagnostics** - Python syntax (+ Ruff errors), JSON, `node --check`, `tsc` after every edit, returned to the agent so it fixes them at once (OpenCode's LSP diagnostics);
+  5. **commit-commands** - `/commit` with a Conventional Commits message written by your model, `/clean-gone`, and a "commit" band after turns that changed files (Anthropic's commit-commands plugin).
+
+## Reverse engineering layer (optional)
+
+Settings → **Reverse eng.**: an opt-in integration of [REA - Reverse Engineer Anything](https://github.com/morluto/rea) (MIT) with its exact feature set:
+
+- REA's **MCP server**, pinned (`npx -y rea-agents@6.4.0 mcp`, named `rea`): native binaries through Hopper / Ghidra / IDA, Go / Rust / .NET / WASM / EVM artifacts, JavaScript and Electron apps, websites and network captures, Android, firmware, SQLite, recorded crashes and process behavior - with evidence for every conclusion;
+- REA's **`reverse-engineer-anything` skill**, vendored with its references, license and disclaimer, so the agent follows REA's evidence-first workflows;
+- `/reverse <target> <question>` in any session; provider choice (`REA_ANALYSIS_PROVIDER`), compact tool schemas for local models (`REA_MCP_INPUT_SCHEMA_PROFILE=compact`), extra REA environment, long timeouts, and a **readiness check** (`rea doctor`).
+
+It is off by default and can only be enabled after acknowledging REA's responsible-use terms (lawful analysis of software you own or are authorized to examine). Requires Node.js 22.19+, 24.11+ or 26+; REA tools ask for permission like any MCP tool.
 
 ## savvy-flow
 
@@ -205,6 +273,10 @@ Plus: session fork, manual compaction, system prompts with a stable prefix (KV-c
 8. **Grouped tool calls**, "jump to latest", scrolling that stays pinned.
 9. **Status bar**: context gauge, tokens, compactions, goal, **Auto** switch.
 10. **Message actions**: copy, retry, edit and resend, fork from here; clickable answers to agent questions.
+11. **Thinking cards**: live shimmer and preview, then a "Thought for Ns · steps" timeline.
+12. **Activity view** with filters and **Export PDF / Markdown**.
+13. **Slash menu** with the app's commands, mod commands and skills; **MCP chip** to switch servers per session.
+14. **Mod status line** under the prompt, mod **bands** with buttons above it, **toasts**, and a **Mods** side-panel tab.
 
 ## Windows notes
 
@@ -230,9 +302,10 @@ Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-co
 
 ```
  Browser ── React 19 · Vite · Tailwind ────────────────────────────────────────┐
- │ Sessions │ Transcript (text, tools, diffs, plan, reviews) │ Agents · Plan ·   │
- │          │ savvy-progress bar · questions · permissions    │ Files · Git ·     │
- │          │ prompt (queue, history, auto)                   │ Trace             │
+ │ Sessions │ Transcript (thinking, text, tools, diffs, plan, │ Agents · Plan ·   │
+ │          │ reviews) · savvy-progress bar · questions ·     │ Files · Git ·     │
+ │          │ permissions · mod band · prompt · status line   │ Trace · Mods      │
+ │ Activity view (PDF export) · Settings: LLM … MCP · Skills · Mods · Reverse   │
  └──────────────── REST /api/*  +  SSE /api/sessions/{id}/events ───────────────┘
                                    │
  FastAPI (server.py → backend/) ───┴──────────────────────────────────────────────┐
@@ -241,6 +314,12 @@ Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-co
  │ planner.py    decomposition: modules, DAG, conflicts, waves, critical path    │
  │ tools.py      read/edit/multiedit/apply_patch/bash/repomap/... (sandboxed)     │
  │ bitbucket.py  branch, commit, push, pull request (Server / Cloud)            │
+ │ extensions.py what MCP, skills and mods add to each agent run                 │
+ │ mcp_client.py MCP protocol client (stdio, Streamable HTTP, SSE) + manager     │
+ │ mcp_tools.py  MCP tools for agents: tool search, permissions, presets, REA    │
+ │ skills.py     Agent Skills: discovery, skill tool, /commands, editing, AI     │
+ │ mods.py       mod loader, hook chains, ctx API (+ builtin/mods, builtin/skills)│
+ │ report.py     activity collection, Markdown and PDF report                    │
  │ osutil.py     Windows/macOS/Linux: shells, processes, line endings, paths     │
  │ snapshot · journal · compaction · permissions · repomap · editing · llm       │
  └──────────────────────────────────┬─────────────────────────────────────────────┘
@@ -248,16 +327,18 @@ Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-co
                      your local LLM (as in NEXUS.AI)
 ```
 
-Settings and sessions live in `data/` (`ORCH_DATA_DIR` to move it). See [`filemap.md`](filemap.md) for every file.
+Settings and sessions live in `data/` (`ORCH_DATA_DIR` to move it). Cross-origin requests are only accepted from the dev UI on :4000 (add origins with `ORCH_CORS_ORIGINS`): another web page open in your browser cannot send JSON requests to the API to drive the agent or install a mod. See [`filemap.md`](filemap.md) for every file.
 
 ## Tests and CI
 
 ```bash
 pip install -r requirements.txt
-python -m pytest            # 67 tests: editing, patches, permissions, planner, snapshots, compaction,
+python -m pytest            # 97 tests: editing, patches, permissions, planner, snapshots, compaction,
                             # retries, overflow, auto-fix, budget, crash resume, undo/fork, goal,
                             # modular flow, parallel waves, auto mode, projects, Bitbucket Server + Cloud,
-                            # CRLF, process trees, shells
+                            # CRLF, process trees, shells, MCP (stdio, HTTP, tool search, permissions,
+                            # project approval; official SDK interop when `pip install mcp`), skills,
+                            # mods (top 5, user mods, /mod builder, /commit), reasoning, activity + PDF
 cd frontend && npm run lint # TypeScript
 ```
 
@@ -268,3 +349,5 @@ GitHub Actions runs the backend tests, the frontend build and a server smoke tes
 - Interface and agents inspired by [OpenCode](https://github.com/sst/opencode); harness ideas from [OpenClaude](https://github.com/Twigpine/openclaude).
 - savvy-flow and savvy-progress: [JohnnyVizz/claude-kit](https://github.com/JohnnyVizz/claude-kit) (MIT), adapted to local LLMs.
 - LLM configuration shared with NEXUS.AI / DOINg.AI.
+- [Model Context Protocol](https://modelcontextprotocol.io); skills follow Anthropic's [Agent Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview) format; mods follow Claude Code's mod / hook model; the built-in mods are inspired by ccstatusline, the Prettier / Black PostToolUse hooks, the dangerous-command PreToolUse guards, OpenCode's LSP diagnostics and Anthropic's commit-commands plugin.
+- Reverse engineering layer: [REA](https://github.com/morluto/rea) by morluto (MIT); its skill is vendored in `backend/builtin/skills/reverse-engineer-anything` with its license and disclaimer.

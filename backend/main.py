@@ -82,7 +82,11 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="DOINg.AI SuperCode", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# The UI is same-origin (served by this app, or proxied by the Vite dev server): only local dev origins are allowed
+# cross-origin, so a web page cannot drive the agent (or install a mod) through the browser. ORCH_CORS_ORIGINS adds more.
+CORS_ORIGINS = ["http://localhost:4000", "http://127.0.0.1:4000"] + [
+    o.strip() for o in os.environ.get("ORCH_CORS_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 
 # ---------------------------------------------------------------------------
@@ -751,14 +755,15 @@ async def post_message(sid: str, body: MessageIn) -> dict:
         MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": text}])
         MessageSink(s).add_message("assistant", "system", parts=[{"type": "notice", "text": f"Blocked by the {submitted.get('mod', '')} mod: {submitted['deny']}"}])
         return {"ok": False, "blocked": submitted["deny"]}
+    typed = text  # the transcript shows what the user typed; agents get the mods' rewrite
     if isinstance(submitted, dict) and str(submitted.get("text") or "").strip():
         text = str(submitted["text"]).strip()
     s.data["agent"] = agent
 
-    MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": text}])
-    journal.log(s, "user", agent=agent, text=text[:2000])
+    MessageSink(s).add_message("user", agent, parts=[{"id": new_id("prt"), "type": "text", "text": typed}])
+    journal.log(s, "user", agent=agent, text=typed[:2000], **({"rewritten": text[:2000]} if text != typed else {}))
     if s.data["title"] == "New session":
-        s.data["title"] = re.sub(r"\s+", " ", text)[:60]
+        s.data["title"] = re.sub(r"\s+", " ", typed)[:60]
         s.emit("session.updated", {"session": s.summary()})
 
     flow = s.data.get("flow")

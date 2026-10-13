@@ -40,7 +40,7 @@ const en = {
   cmdInit: 'Create or update AGENTS.md for this project',
   cmdHelp: 'Show help',
   helpText:
-    'Agents: **Build** (full tools) · **Plan** (read-only) · **Savvy Flow** (orchestrator + workers). **Auto** mode: no approvals, no questions.\n\nCommands: `/new` project, `/flow <task>`, `/goal <condition>`, `/pr` Bitbucket pull request, `/undo`, `/compact`, `/fork`, `/auto`, `/report`, `/build`, `/plan`, `/agents`, `/settings`, `/init`.\n\nKeys: `Tab` switch agent, `Enter` send, `Shift+Enter` new line, `Esc` interrupt, `@` mention a file.',
+    'Agents: **Build** (full tools) · **Plan** (read-only) · **Savvy Flow** (orchestrator + workers). **Auto** mode: no approvals, no questions.\n\nCommands: `/new` project, `/flow <task>`, `/goal <condition>`, `/pr` Bitbucket pull request, `/activity` (every step + PDF report), `/undo`, `/compact`, `/fork`, `/auto`, `/report`, `/build`, `/plan`, `/agents`, `/settings`, `/init`.\n\nExtensions: `/mod <description>` creates a mod, `/skill-new <need>` writes a skill, `/<skill-name> <args>` runs a skill, `/commit` commits with an AI message, `/reverse <target> <question>` runs REA (optional layer). MCP servers, skills and mods: `/mcp`, `/skills`, `/mods`.\n\nKeys: `Tab` switch agent, `Enter` send, `Shift+Enter` new line, `Esc` interrupt, `@` mention a file.',
   thinking: 'Thinking',
   permissionTitle: 'Permission required',
   allowOnce: 'Allow once',
@@ -299,6 +299,34 @@ const en = {
   shellAuto: 'Auto (bash; on Windows Git Bash, else PowerShell)',
   responseLanguage: 'Language of the agents\' answers',
   autoModeDefault: 'Auto mode by default (no approvals, no questions, permissions granted except deny rules)',
+
+  // v4: thinking, activity and report, MCP, skills, mods, reverse engineering
+  thinkingLive: 'Thinking',
+  thoughtFor: 'Thought for',
+  thoughtSteps: 'steps',
+  thoughtStep: 'step',
+  activity: 'Activity',
+  activityHint: 'Every reasoning step, the savvy plan, tests and actions - export a PDF report',
+  cmdActivity: 'Open the activity view and export a PDF report',
+  cmdMcp: 'Manage MCP servers',
+  cmdSkills: 'Manage skills',
+  cmdMods: 'Manage mods',
+  cmdModCreate: 'Create a mod from a description',
+  cmdReverse: 'Reverse engineer an app with REA (optional layer)',
+  tabMods: 'Mods',
+  tabMcp: 'MCP',
+  tabSkills: 'Skills',
+  tabReverse: 'Reverse eng.',
+  mcpServers: 'MCP servers',
+  mcpNone: 'No MCP server configured.',
+  mcpManage: 'Manage MCP servers',
+  mcpProjectPending: 'This project declares MCP servers waiting for approval',
+  approveServer: 'Approve',
+  modPanelsEmpty: 'Mods show their panels here (diagnostics, blocked actions...).',
+  manageMods: 'Manage mods',
+  commandSourceApp: 'app',
+  permMcp: 'MCP tools (read-only tools are trusted per server)',
+  permMods: 'Installing a mod written by the agent (/mod)',
 };
 
 export type Strings = typeof en;

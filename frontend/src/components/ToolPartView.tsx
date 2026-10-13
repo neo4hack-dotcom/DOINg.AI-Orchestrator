@@ -30,7 +30,19 @@ function label(p: ToolPart): { verb: string; target: string; extra?: string } {
       return { verb: 'Step', target: `${i.done ?? 0}/${i.total ?? '?'}`, extra: i.note };
     case 'task':
       return { verb: 'Task', target: i.description || '' };
+    case 'skill':
+      return { verb: 'Skill', target: i.name || '', extra: i.arguments ? String(i.arguments).slice(0, 40) : undefined };
+    case 'mcp_search':
+      return { verb: 'MCP search', target: i.query || '' };
+    case 'mcp_call':
+      return { verb: `MCP ${i.server || ''}`, target: i.tool || '', extra: JSON.stringify(i.arguments || {}).slice(0, 60) };
+    case 'mcp_resources':
+      return { verb: `MCP ${i.server || ''}`, target: i.uri || 'resources' };
     default:
+      if (p.tool.startsWith('mcp__')) {
+        const [, server, tool] = p.tool.split('__');
+        return { verb: `MCP ${server}`, target: tool, extra: JSON.stringify(i).slice(0, 70) };
+      }
       return { verb: p.tool, target: JSON.stringify(i).slice(0, 80) };
   }
 }
@@ -64,7 +76,11 @@ export function ToolPartView({ part }: { part: ToolPart }) {
         <span className={`shrink-0 font-semibold ${part.status === 'error' ? 'text-err' : 'text-fg'}`}>{verb}</span>
         {part.tool === 'task' && part.input?.tier && <TierChip tier={part.input.tier} />}
         <span className="min-w-0 truncate text-muted">{target}</span>
-        {extra && <span className="shrink-0 text-[11px] text-faint">{extra}</span>}
+        {extra && <span className="min-w-0 shrink truncate text-[11px] text-faint">{extra}</span>}
+        {part.metadata?.diagnostics?.length > 0 && (
+          <span className="shrink-0 rounded bg-warn/15 px-1 text-[10px] text-warn" title={part.metadata.diagnostics.join('\n')}>⚠ {part.metadata.diagnostics.length}</span>
+        )}
+        {part.metadata?.blockedBy && <span className="shrink-0 rounded bg-err/15 px-1 text-[10px] text-err">blocked · {part.metadata.blockedBy}</span>}
         {part.status === 'error' && !open && <span className="min-w-0 truncate text-[11px] text-err/80">{part.output}</span>}
       </button>
       {open && (

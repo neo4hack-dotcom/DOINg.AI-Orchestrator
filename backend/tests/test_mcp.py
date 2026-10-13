@@ -356,3 +356,17 @@ async def test_official_sdk_streamable_http_interop(tmp_path):
     finally:
         proc.kill()
         proc.wait()
+
+
+async def test_failed_server_is_not_retried_by_every_run(tmp_path):
+    bad = tmp_path / "bad.py"
+    bad.write_text("import sys\nsys.exit(1)\n")
+    mgr = McpManager()
+    cfg = {"command": sys.executable, "args": [str(bad)], "startupTimeout": 10}
+    tools, errors = await mgr.tools({"bad": cfg}, str(tmp_path))
+    assert not tools and "bad" in errors
+    import time as _time
+    started = _time.monotonic()
+    _, errors = await mgr.tools({"bad": cfg}, str(tmp_path))
+    assert "next retry in" in errors["bad"] and _time.monotonic() - started < 1
+    await mgr.shutdown()

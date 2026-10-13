@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, Menu, PanelLeft, PanelRight, X } from 'lucide-react';
+import { ArrowDown, ClipboardList, Menu, PanelLeft, PanelRight, X } from 'lucide-react';
 import { api } from './api';
 import { applyEvent } from './sessionReducer';
 import { I18nContext, STRINGS } from './i18n';
-import type { AgentMode, AppConfig, JournalEntry, ServerEvent, Session, SessionSummary } from './types';
+import type { AgentMode, AppConfig, CommandInfo, JournalEntry, ModToast, ServerEvent, Session, SessionSummary } from './types';
 import { agentColor, cx, fmtTokens } from './util';
 import { clearAttention, notify, requestNotifyPermission } from './notify';
+import { ActivityView } from './components/ActivityView';
 import { CommandPalette, type PaletteItem } from './components/CommandPalette';
 import { COMMANDS, Composer } from './components/Composer';
 import { Markdown } from './components/Markdown';
+import { McpChip } from './components/McpChip';
+import { ModBand, ModStatusLine, Toasts } from './components/ModUi';
 import { PermissionBar } from './components/PermissionBar';
 import { ProjectDialog } from './components/ProjectDialog';
 import { ProgressBar } from './components/ProgressBar';
 import { QuestionBar } from './components/QuestionBar';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, type SettingsTab } from './components/SettingsModal';
 import { SidePanel, type SideTab } from './components/SidePanel';
 import { Sidebar } from './components/Sidebar';
 import { TodoList } from './components/TodoList';
@@ -49,6 +52,11 @@ export default function App() {
   const [liveJournal, setLiveJournal] = useState<JournalEntry[]>([]);
   const [filesVersion, setFilesVersion] = useState(0);
   const [stuck, setStuck] = useState(true);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('llm');
+  const [toasts, setToasts] = useState<ModToast[]>([]);
+  const [commands, setCommands] = useState<CommandInfo[]>([]);
+  const [extVersion, setExtVersion] = useState(0);
   const autoOpenedFor = useRef<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -138,6 +146,14 @@ export default function App() {
         }
         return;
       }
+      if (e.type === 'mods.toast') {
+        setToasts((list) => [...list.slice(-5), { id: Date.now() + Math.random(), mod: e.mod, text: e.text, kind: e.kind }]);
+        return;
+      }
+      if (e.type === 'mods.changed' || e.type === 'skills.changed') {
+        setExtVersion((v) => v + 1);
+        return;
+      }
       if (buffer) buffer.push(e);
       else apply(e);
       const tt = tRef.current;
@@ -160,6 +176,18 @@ export default function App() {
   }, [currentId]);
 
   const busy = Boolean(session?.busy);
+  const directory = session?.directory || config?.workspace || '';
+
+  // Slash commands the server answers: /mod, /reverse, mod commands, skills.
+  useEffect(() => {
+    api.commands(directory).then(setCommands).catch(() => {});
+  }, [directory, extVersion]);
+
+  const openSettings = (tab: SettingsTab = 'llm') => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  };
+  const dismissToast = useCallback((id: number) => setToasts((list) => list.filter((x) => x.id !== id)), []);
   const flow = session?.flow ?? null;
   const runs = session?.runs ?? [];
 
@@ -340,7 +368,9 @@ export default function App() {
     else if (name === 'agents') {
       setPanelOpen(true);
       setSideTab('agents');
-    } else if (name === 'settings') setSettingsOpen(true);
+    } else if (name === 'settings') openSettings('llm');
+    else if (name === 'activity') currentId && setActivityOpen(true);
+    else if (name === 'mcp' || name === 'skills' || name === 'mods') openSettings(name);
     else if (name === 'help') setHelp(true);
     else if (name === 'init') send(INIT_PROMPT, 'build');
     else if (name === 'report') downloadReport();
@@ -407,13 +437,17 @@ export default function App() {
     }));
     items.push({ id: 'cmd-flow', group: 'cmd', label: '/flow …', hint: t.cmdFlow, run: () => setInject({ text: '/flow ', nonce: Date.now() }) });
     items.push({ id: 'cmd-goal', group: 'cmd', label: '/goal …', hint: t.cmdGoal, run: () => setInject({ text: '/goal ', nonce: Date.now() }) });
-    (['agents', 'plan', 'files', 'git', 'trace'] as SideTab[]).forEach((k) => items.push({
-      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, git: t.tabGit, trace: t.tabTrace }[k],
+    (['agents', 'plan', 'files', 'git', 'trace', 'mods'] as SideTab[]).forEach((k) => items.push({
+      id: `tab-${k}`, group: 'panel', label: { agents: t.tabAgents, plan: t.tabPlan, files: t.tabFiles, git: t.tabGit, trace: t.tabTrace, mods: t.tabMods }[k],
       run: () => { setSideTab(k); setPanelOpen(true); },
+    }));
+    commands.filter((c) => !COMMANDS.some((x) => x.name === c.name)).forEach((c) => items.push({
+      id: `srv-${c.name}`, group: 'cmd', label: `/${c.name}${c.argumentHint ? ' …' : ''}`, hint: c.description,
+      run: () => (c.argumentHint ? setInject({ text: `/${c.name} `, nonce: Date.now() }) : send(`/${c.name}`, agent)),
     }));
     sessions.forEach((s) => items.push({ id: `ses-${s.id}`, group: 'session', label: s.title, hint: s.directory, run: () => setCurrentId(s.id) }));
     return items;
-  }, [sessions, t]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessions, t, commands]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const runningRuns = runs.filter((r) => r.status === 'running').length;
   const showProgress = Boolean((flow && dismissedFlow !== flow.id) || runningRuns);
@@ -438,7 +472,7 @@ export default function App() {
             onSelect={(id) => { setCurrentId(id); setNavOpen(false); }}
             onNew={() => setProjectOpen(true)}
             onDelete={deleteSession}
-            onSettings={() => setSettingsOpen(true)}
+            onSettings={() => openSettings()}
             config={config}
             llmOk={llmOk}
             lang={lang}
@@ -458,6 +492,12 @@ export default function App() {
             </div>
             {totalTokens > 0 && <span className="hidden shrink-0 text-[11px] tabular-nums text-faint sm:inline">{fmtTokens(totalTokens)} tok</span>}
             <button type="button" onClick={() => setPaletteOpen(true)} className="hidden shrink-0 rounded border border-line px-2 py-1 text-[11px] text-faint hover:text-fg sm:block">Ctrl K</button>
+            {session && (
+              <button type="button" onClick={() => setActivityOpen(true)} title={t.activityHint}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded border border-line px-2 py-1 text-[12px] text-muted hover:text-fg">
+                <ClipboardList size={13} /> <span className="hidden sm:inline">{t.activity}</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setPanelOpen((o) => !o)}
@@ -490,7 +530,7 @@ export default function App() {
                       <li><span className="text-faint">▸</span> <Markdown text={t.shortcutsText} /></li>
                     </ul>
                     {llmOk === false && (
-                      <button type="button" onClick={() => setSettingsOpen(true)} className="rounded border border-err/50 px-3 py-1.5 text-err hover:bg-err/10">
+                      <button type="button" onClick={() => openSettings()} className="rounded border border-err/50 px-3 py-1.5 text-err hover:bg-err/10">
                         {t.configureLlm} · {t.llmOffline}
                       </button>
                     )}
@@ -560,6 +600,7 @@ export default function App() {
                 onReply={(pid, r) => currentId && api.permission(currentId, pid, r).catch((e) => setError(e.message))}
               />
             )}
+            {session && <ModBand ui={session.modUi} onRun={(cmd) => send(cmd, agent)} disabled={busy} />}
             <Composer
               sessionId={currentId}
               agent={agent}
@@ -581,7 +622,13 @@ export default function App() {
               autonomous={autoOn}
               onToggleAuto={toggleAuto}
               onClearGoal={() => currentId && api.goal(currentId, null).then(() => setSession((s) => (s ? { ...s, goal: null } : s)))}
+              serverCommands={commands}
+              footerExtra={(
+                <McpChip sessionId={currentId} directory={directory} disabled={session?.mcpDisabled || []} version={extVersion}
+                  onChange={(list) => setSession((s) => (s ? { ...s, mcpDisabled: list } : s))} onManage={() => openSettings('mcp')} />
+              )}
             />
+            {session && <ModStatusLine ui={session.modUi} />}
           </div>
         </main>
 
@@ -601,7 +648,9 @@ export default function App() {
               busy={busy}
               filesVersion={filesVersion}
               liveJournal={liveJournal}
-              onOpenSettings={() => setSettingsOpen(true)}
+              onOpenSettings={() => openSettings('bitbucket')}
+              modUi={session?.modUi}
+              onManageMods={() => openSettings('mods')}
             />
           </div>
         )}
@@ -610,10 +659,17 @@ export default function App() {
 
         {paletteOpen && <CommandPalette items={paletteItems} onClose={() => setPaletteOpen(false)} />}
 
+        {activityOpen && currentId && <ActivityView sessionId={currentId} busy={busy} onClose={() => setActivityOpen(false)} />}
+
+        <Toasts toasts={toasts} onDismiss={dismissToast} />
+
         {settingsOpen && config && (
           <SettingsModal
             initial={config}
-            onClose={() => setSettingsOpen(false)}
+            initialTab={settingsTab}
+            directory={directory}
+            onRunCommand={currentId ? (text) => send(text, 'build') : undefined}
+            onClose={() => { setSettingsOpen(false); setExtVersion((v) => v + 1); }}
             onSaved={(c) => {
               setConfig(c);
               setLlmOk(null);

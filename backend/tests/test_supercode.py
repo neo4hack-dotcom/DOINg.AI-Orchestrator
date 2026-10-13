@@ -215,3 +215,15 @@ async def test_pull_request_existing_and_errors(client, fake_server, bitbucket_s
     BB["existing"] = False
     bad = await client.post(f"/api/sessions/{sid}/pr", json={"title": "x", "branch": "develop", "target": "develop"})
     assert bad.status_code == 400 and "both" in bad.json()["detail"]
+
+
+async def test_cors_only_allows_local_dev_origins():
+    import httpx
+
+    from backend.main import app
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        evil = await c.options("/api/config", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "PUT"})
+        assert evil.headers.get("access-control-allow-origin") is None
+        dev = await c.options("/api/config", headers={"Origin": "http://localhost:4000", "Access-Control-Request-Method": "PUT"})
+        assert dev.headers.get("access-control-allow-origin") == "http://localhost:4000"

@@ -1,17 +1,19 @@
 import { X } from 'lucide-react';
-import type { AgentRun, Flow, JournalEntry } from '../types';
+import type { AgentRun, Flow, JournalEntry, ModUi } from '../types';
 import { useT } from '../i18n';
 import { cx } from '../util';
 import { AgentsPanel } from './AgentsPanel';
 import { FilesPanel } from './FilesPanel';
 import { GitPanel } from './GitPanel';
+import { ModPanels } from './ModUi';
 import { PlanBoard } from './PlanBoard';
 import { TracePanel } from './TracePanel';
 
-export type SideTab = 'agents' | 'plan' | 'files' | 'git' | 'trace';
+export type SideTab = 'agents' | 'plan' | 'files' | 'git' | 'trace' | 'mods';
 
 /* Right panel: savvy-progress agents, the plan board, changed files and the trace. */
-export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal, onOpenSettings }: {
+export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRunId, onOpenRun, onLoadRun, busy, filesVersion, liveJournal, onOpenSettings,
+  modUi, onManageMods }: {
   tab: SideTab;
   onTab: (t: SideTab) => void;
   onClose: () => void;
@@ -25,6 +27,8 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
   filesVersion: number;
   liveJournal: JournalEntry[];
   onOpenSettings: () => void;
+  modUi?: ModUi;
+  onManageMods: () => void;
 }) {
   const t = useT();
   const running = runs.filter((r) => r.status === 'running').length;
@@ -34,6 +38,7 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
     ['files', t.tabFiles, null],
     ['git', t.tabGit, null],
     ['trace', t.tabTrace, null],
+    ['mods', t.tabMods, Object.keys(modUi?.panels || {}).length || null],
   ];
   return (
     <aside className="flex h-full w-full flex-col bg-bg">
@@ -53,6 +58,7 @@ export function SidePanel({ tab, onTab, onClose, sessionId, runs, flow, focusRun
         {tab === 'files' && <FilesPanel sessionId={sessionId} busy={busy} version={filesVersion} />}
         {tab === 'git' && <GitPanel sessionId={sessionId} busy={busy} version={filesVersion} onOpenSettings={onOpenSettings} />}
         {tab === 'trace' && <TracePanel sessionId={sessionId} live={liveJournal} />}
+        {tab === 'mods' && <ModPanels ui={modUi} onManage={onManageMods} />}
       </div>
     </aside>
   );

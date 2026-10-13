@@ -72,6 +72,8 @@ export function applyEvent(s: Session, e: ServerEvent): Session {
       return { ...s, busy: e.busy };
     case 'session.updated':
       return { ...s, title: e.session.title, agent: e.session.agent, busy: e.session.busy };
+    case 'mods.ui':
+      return { ...s, modUi: e.modUi };
     default:
       return s;
   }

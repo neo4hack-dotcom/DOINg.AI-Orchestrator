@@ -1,28 +1,13 @@
 import { memo, useState } from 'react';
-import { AlertTriangle, Brain, Check, ChevronRight, Copy, GitBranch, Info, Layers, Pencil, RotateCcw, Target } from 'lucide-react';
+import { AlertTriangle, Check, ChevronRight, Copy, GitBranch, Info, Layers, Pencil, RotateCcw, Target, TerminalSquare } from 'lucide-react';
 import type { CompactionPart, Flow, Message, Part, ToolPart } from '../types';
 import { useT } from '../i18n';
 import { agentColor, cx, fmtTokens } from '../util';
 import { Markdown } from './Markdown';
 import { PlanCard } from './PlanCard';
+import { ReasoningBlock } from './ReasoningBlock';
 import { ReviewCard } from './ReviewCard';
 import { ToolPartView } from './ToolPartView';
-
-function Reasoning({ text, live }: { text: string; live: boolean }) {
-  const t = useT();
-  const [open, setOpen] = useState(false);
-  if (!text.trim()) return null;
-  return (
-    <div className="my-1">
-      <button type="button" onClick={() => setOpen((o) => !o)} className="flex items-center gap-1.5 px-1 text-faint hover:text-muted">
-        <ChevronRight size={12} className={`transition-transform ${open ? 'rotate-90' : ''}`} />
-        <Brain size={12} className={live ? 'pulse' : ''} />
-        <span className="italic">{t.thinking}</span>
-      </button>
-      {open && <div className="ml-6 mt-1 whitespace-pre-wrap border-l border-line pl-3 text-[12px] italic text-faint">{text}</div>}
-    </div>
-  );
-}
 
 function Checkpoint({ part }: { part: CompactionPart }) {
   const t = useT();
@@ -154,7 +139,8 @@ export const Transcript = memo(function Transcript({ messages, flow = null, busy
           </div>
         );
       case 'reasoning':
-        return <Reasoning key={p.id} text={p.text} live={busy && m.id === lastMsgId} />;
+        return <ReasoningBlock key={p.id} text={p.text} live={busy && m.id === lastMsgId} startedAt={p.startedAt} endedAt={p.endedAt}
+          agent={m.agent !== 'build' && m.agent !== 'plan' ? m.agent : undefined} />;
       case 'compaction':
         return <Checkpoint key={p.id} part={p} />;
       case 'notice':
@@ -199,10 +185,12 @@ export const Transcript = memo(function Transcript({ messages, flow = null, busy
         if (b.kind === 'user') {
           const text = m.parts.map((p) => (p.type === 'text' ? p.text : '')).join('\n');
           const goal = m.parts.some((p) => p.type === 'text' && p.goal);
+          const command = m.parts.map((p) => (p.type === 'text' ? p.command : undefined)).find(Boolean);
           return (
             <div key={m.id} className={cx('group relative rounded-r border-l-2 bg-panel px-3 py-2', reverted && 'opacity-40', !compact && 'mt-4')}
               style={{ borderColor: agentColor(m.agent) }}>
               {goal && <div className="mb-0.5 flex items-center gap-1 text-[11px] text-accent"><Target size={11} /> {t.goal}</div>}
+              {command && <div className="mb-0.5 flex items-center gap-1 text-[11px] text-accent"><TerminalSquare size={11} /> /{command}</div>}
               <div className={cx('whitespace-pre-wrap break-words', goal && 'text-muted')}>{text}</div>
               {reverted && <div className="mt-1 text-[11px] text-faint">{t.reverted}</div>}
               {!compact && !reverted && !busy && (

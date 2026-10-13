@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,8 @@ import httpx
 from .osutil import IS_WINDOWS, kill_tree
 
 PROTOCOL_VERSION = "2025-06-18"
+# A server that failed to start is not retried by every agent run before this delay (long unattended runs).
+RETRY_AFTER_SECONDS = 120
 CLIENT_INFO = {"name": "doing-ai-supercode", "title": "DOINg.AI SuperCode", "version": "4.0.0"}
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -365,6 +368,7 @@ class McpConnection:
         self._pending: dict[Any, asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self.log: deque[str] = deque(maxlen=40)
+        self.failed_at = 0.0
 
     @property
     def timeout(self) -> float:
@@ -409,6 +413,7 @@ class McpConnection:
                 await self.refresh_tools()
             except Exception as e:  # noqa: BLE001 - recorded and surfaced in the UI
                 self.status, self.error = "error", f"{e}"
+                self.failed_at = time.monotonic()
                 tail = self.transport.stderr_tail() if self.transport else ""
                 if tail:
                     self.error += f"\n{tail[-800:]}"
@@ -619,6 +624,9 @@ class McpManager:
             conn = McpConnection(name, cfg, directory)
             self.connections[key] = conn
         if conn.status != "connected":
+            wait = RETRY_AFTER_SECONDS - (time.monotonic() - conn.failed_at)
+            if conn.failed_at and wait > 0:
+                raise McpError(f"{conn.error.splitlines()[0] if conn.error else 'failed to start'} (next retry in {int(wait)}s)")
             await conn.connect()
         return conn
 

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUp, Bot, ListPlus, Square, Target, X } from 'lucide-react';
-import type { AgentMode, Goal } from '../types';
+import type { AgentMode, CommandInfo, Goal } from '../types';
 import { useT, type Strings } from '../i18n';
 import { api } from '../api';
 import { agentColor, cx, fmtTokens } from '../util';
@@ -18,9 +18,13 @@ export const COMMANDS: { name: string; desc: keyof Strings; arg?: boolean }[] = 
   { name: 'compact', desc: 'cmdCompact' },
   { name: 'fork', desc: 'cmdFork' },
   { name: 'auto', desc: 'cmdAuto' },
+  { name: 'activity', desc: 'cmdActivity' },
   { name: 'report', desc: 'cmdReport' },
   { name: 'agents', desc: 'cmdAgents' },
   { name: 'init', desc: 'cmdInit' },
+  { name: 'mcp', desc: 'cmdMcp' },
+  { name: 'skills', desc: 'cmdSkills' },
+  { name: 'mods', desc: 'cmdMods' },
   { name: 'settings', desc: 'cmdSettings' },
   { name: 'help', desc: 'cmdHelp' },
 ];
@@ -46,7 +50,8 @@ const draftKey = (sid: string | null) => `orch:draft:${sid || 'new'}`;
 type Item = { key: string; label: string; hint?: string; apply: () => void };
 
 export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbort, onCommand, model, answering, inject,
-  queued, onRemoveQueued, contextTokens, contextWindow, totalTokens, compactions, goal, autonomous, onToggleAuto, onClearGoal }: {
+  queued, onRemoveQueued, contextTokens, contextWindow, totalTokens, compactions, goal, autonomous, onToggleAuto, onClearGoal,
+  serverCommands = [], footerExtra }: {
   sessionId: string | null;
   agent: AgentMode;
   onAgentChange: (a: AgentMode) => void;
@@ -67,6 +72,8 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
   autonomous: boolean;
   onToggleAuto: () => void;
   onClearGoal: () => void;
+  serverCommands?: CommandInfo[];
+  footerExtra?: ReactNode;
 }) {
   const t = useT();
   const [text, setText] = useState('');
@@ -110,7 +117,7 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
   }, [inject]);
 
   const mention = /(^|\s)@([\w./-]*)$/.exec(text);
-  const slash = /^\/(\w*)$/.exec(text);
+  const slash = /^\/([\w-]*)$/.exec(text);
 
   useEffect(() => {
     if (!mention || !sessionId) return;
@@ -124,7 +131,7 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
   const items: Item[] = useMemo(() => {
     if (closedFor === text) return [];
     if (slash) {
-      return COMMANDS.filter((c) => c.name.startsWith(slash[1])).map((c) => ({
+      const local: Item[] = COMMANDS.filter((c) => c.name.startsWith(slash[1])).map((c) => ({
         key: c.name,
         label: `/${c.name}${c.arg ? ' <…>' : ''}`,
         hint: t[c.desc],
@@ -136,6 +143,23 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
           }
         },
       }));
+      // Commands run by the server: /mod, /reverse, mod commands (/commit...) and skills (/code-review...).
+      const remote: Item[] = serverCommands
+        .filter((c) => c.name.startsWith(slash[1]) && !COMMANDS.some((x) => x.name === c.name))
+        .map((c) => ({
+          key: `srv-${c.name}`,
+          label: `/${c.name}${c.argumentHint ? ` ${c.argumentHint}` : ''}`,
+          hint: `${c.source === 'app' ? '' : `[${c.source.replace(/^skill:.*/, 'skill').replace(/^mod:/, 'mod ')}] `}${c.description}`,
+          apply: () => {
+            if (c.argumentHint) setText(`/${c.name} `);
+            else {
+              setText('');
+              pushHistory(`/${c.name}`);
+              onSend(`/${c.name}`, agent);
+            }
+          },
+        }));
+      return [...local, ...remote];
     }
     if (mention) {
       return files.slice(0, 12).map((f) => ({
@@ -145,14 +169,14 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
       }));
     }
     return [];
-  }, [text, files, closedFor]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [text, files, closedFor, serverCommands]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => setSel(0), [items.length]);
 
   const submit = () => {
     const value = text.trim();
     if (!value) return;
-    const cmd = /^\/(\w+)(?:\s+([\s\S]*))?$/.exec(value);
+    const cmd = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(value);
     if (cmd && COMMANDS.some((c) => c.name === cmd[1]) && cmd[1] !== 'flow') {
       setText('');
       pushHistory(value);
@@ -284,6 +308,7 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
             className={cx('flex shrink-0 items-center gap-1 rounded border px-1', autonomous ? 'border-warn/60 bg-warn/10 text-warn' : 'border-line text-faint hover:text-fg')}>
             <Bot size={11} /> {t.autonomous}
           </button>
+          {footerExtra}
           {busy && <span className="pulse shrink-0 text-accent">{t.working}</span>}
           <span className="ml-auto hidden shrink-0 items-center gap-2.5 text-faint md:flex">
             {contextWindow > 0 && contextTokens > 0 && (

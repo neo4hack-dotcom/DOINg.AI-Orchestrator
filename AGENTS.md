@@ -15,9 +15,12 @@ Conventions:
 - savvy-flow sequencing lives in `backend/flow.py`, not in prompts: prompts only ask for one step with a strict output format (local models). Graph rules (deps, conflicts, waves) live in `backend/planner.py` and are unit-tested.
 - Session state the UI needs must stay JSON-serializable; worker transcripts are stored per run (`data/sessions/<id>/<run>.json`) and served by `/runs/{id}`. Every event carries `seq`: the client drops events older than its snapshot.
 - Anything worth auditing goes through `journal.log(session, kind, ...)`.
-- UI colors come from CSS variables in `frontend/src/index.css` (`--x` hex for inline styles, `--x-rgb` channels for Tailwind `/opacity`). The UI is English only: all strings go through `i18n.ts`.
+- UI colors come from CSS variables in `frontend/src/index.css` (`--x` hex for inline styles, `--x-rgb` channels for Tailwind `/opacity`). The UI is English only: shared strings go through `i18n.ts`; the self-contained panels (Activity view, Settings > MCP / Skills / Mods / Reverse eng.) keep their English copy inline.
 - Windows matters: read/write files with `osutil.read_text/write_text` (byte-exact newlines), show paths with `osutil.posix`, run processes with `osutil.run_command` (never asyncio subprocesses or `os.killpg`). CI runs on windows-latest.
 - Auto mode (`config.auto_mode(cfg, session.data)`) must never leave a human prompt on the path: approvals, permissions and questions all have an auto branch.
 - `scripts/fake_llm.py` is used by the tests: keep its role detection in sync with prompt headings in `backend/prompts.py` ("Phase: PLAN", "phase REVIEW", "phase CLOSE", "worker in the savvy-flow pipeline").
+- Extensions: an `AgentSpec.extensions` level (`all` / `local` / `read` / `none`) decides what MCP tools, skills and mod tools an agent gets (`backend/extensions.py`). Every tool call goes through the mods' `tool.call` chain in `agent.execute_tool`: keep permission + execution inside the chain's default (`engine`). New tool metadata worth reporting goes in `ToolResult.metadata` (edit tools set `files`).
+- MCP: never import an SDK at runtime - `backend/mcp_client.py` speaks the protocol; test interop in `backend/tests/test_mcp.py`. A project's `.mcp.json` server must stay inert until approved.
+- Built-in mods and skills live in `backend/builtin/`; mods use only the stdlib and the `ctx` API (they also run on Windows: quote paths, no bash-only syntax). The REA skill is vendored with its instructions unchanged (only the frontmatter and a short header note were added; MIT: keep LICENSE and DISCLAIMER.md).
 
 See `README.md` (features, architecture) and `filemap.md` (where things live).

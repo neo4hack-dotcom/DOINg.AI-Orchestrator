@@ -4,9 +4,14 @@ import type { AppConfig, Tier } from '../types';
 import { useT, type Strings } from '../i18n';
 import { api } from '../api';
 import { TIERS, cx } from '../util';
+import { McpSettings } from './McpSettings';
+import { ModsManager } from './ModsManager';
+import { ReverseSettings } from './ReverseSettings';
+import { SkillsManager } from './SkillsManager';
 import { TierChip, TierIcon } from './TierIcon';
 
-type Tab = 'llm' | 'tiers' | 'workspace' | 'bitbucket' | 'flow' | 'context' | 'agent';
+export type SettingsTab = 'llm' | 'tiers' | 'workspace' | 'bitbucket' | 'flow' | 'context' | 'agent' | 'mcp' | 'skills' | 'mods' | 'reverse';
+type Tab = SettingsTab;
 
 const TIER_DESC: Record<Tier, keyof Strings> = {
   fable: 'tierFable',
@@ -49,10 +54,12 @@ const rulesToText = (rules: AppConfig['permissions']['bashRules']) => rules.map(
 const textToRules = (text: string): AppConfig['permissions']['bashRules'] =>
   text.split('\n').map((l) => /^(.+?)\s*=\s*(allow|ask|deny)\s*$/.exec(l.trim())).filter(Boolean).map((m) => ({ pattern: m![1].trim(), action: m![2] as 'allow' | 'ask' | 'deny' }));
 
-export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfig; onClose: () => void; onSaved: (c: AppConfig) => void }) {
+export function SettingsModal({ initial, onClose, onSaved, initialTab = 'llm', directory = '', onRunCommand }: {
+  initial: AppConfig; onClose: () => void; onSaved: (c: AppConfig) => void; initialTab?: Tab; directory?: string; onRunCommand?: (text: string) => void;
+}) {
   const t = useT();
   const [cfg, setCfg] = useState<AppConfig>(initial);
-  const [tab, setTab] = useState<Tab>('llm');
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [test, setTest] = useState<{ ok: boolean; message: string; models?: string[] } | null>(null);
   const [testing, setTesting] = useState(false);
   const [nexusPath, setNexusPath] = useState(initial.nexusDbPath || '');
@@ -129,11 +136,13 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
   };
 
   const models = test?.models || [];
-  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['bitbucket', t.tabBitbucket], ['flow', t.tabFlow], ['context', t.tabContext], ['agent', t.tabAgentCfg]];
+  const tabs: [Tab, string][] = [['llm', t.tabLlm], ['tiers', t.tabTiers], ['workspace', t.tabWorkspace], ['bitbucket', t.tabBitbucket], ['flow', t.tabFlow],
+    ['context', t.tabContext], ['agent', t.tabAgentCfg], ['mcp', t.tabMcp], ['skills', t.tabSkills], ['mods', t.tabMods], ['reverse', t.tabReverse]];
+  const runAndClose = onRunCommand ? (text: string) => { onRunCommand(text); onClose(); } : undefined;
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div role="dialog" aria-modal aria-label={t.settings} className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-line bg-panel shadow-2xl">
+      <div role="dialog" aria-modal aria-label={t.settings} className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-line bg-panel shadow-2xl">
         <div className="flex items-center border-b border-line px-4 py-3">
           <span className="font-bold">{t.settings}</span>
           <button type="button" onClick={onClose} className="ml-auto text-faint hover:text-fg" aria-label={t.close}><X size={16} /></button>
@@ -252,8 +261,8 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               <Field label={t.workspace} hint={t.workspaceHint}>
                 <input className={inputCls} value={cfg.workspace} onChange={(e) => setCfg((c) => ({ ...c, workspace: e.target.value }))} />
               </Field>
-              {(['edit', 'bash', 'webfetch'] as const).map((k) => (
-                <Field key={k} label={k === 'edit' ? t.permEdit : k === 'bash' ? t.permBash : t.permWeb}>
+              {(['edit', 'bash', 'webfetch', 'mcp', 'mods'] as const).map((k) => (
+                <Field key={k} label={{ edit: t.permEdit, bash: t.permBash, webfetch: t.permWeb, mcp: t.permMcp, mods: t.permMods }[k]}>
                   <div className="flex gap-1.5">
                     {(['allow', 'ask', 'deny'] as const).map((v) => (
                       <button key={v} type="button" onClick={() => setPerm({ [k]: v })}
@@ -369,6 +378,10 @@ export function SettingsModal({ initial, onClose, onSaved }: { initial: AppConfi
               </div>
             </>
           )}
+          {tab === 'mcp' && <McpSettings cfg={cfg} setCfg={setCfg} directory={directory || cfg.workspace} />}
+          {tab === 'skills' && <SkillsManager directory={directory || cfg.workspace} onRunCommand={runAndClose} />}
+          {tab === 'mods' && <ModsManager onRunCommand={runAndClose} />}
+          {tab === 'reverse' && <ReverseSettings cfg={cfg} setCfg={setCfg} />}
           <datalist id="llm-models">{models.map((m) => <option key={m} value={m} />)}</datalist>
         </div>
 
