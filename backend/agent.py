@@ -15,15 +15,17 @@ Long-run hardening (OpenCode / OpenClaude):
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from . import compaction, extensions, journal, llm, mcp_tools, mods, permissions
-from .config import auto_mode, load_config
+from .config import auto_mode, load_config, permission_mode
 from .session import MessageSink, Session, new_id, now_ms
 from .tools import TOOLS, ToolContext, ToolDef, ToolError, _clip, bound_output
 
@@ -127,28 +129,91 @@ async def ask_questions(session: Session, agent: str, run_id: Optional[str], que
     return answers
 
 
-def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
-                       tool: Optional[ToolDef] = None) -> str:
+EDIT_PATH_KEYS = ("path", "file_path", "filePath")
+
+
+def _edit_paths(session: Session, args: dict) -> list[str]:
+    """Workspace-relative paths an edit tool call touches (apply_patch: every file of the patch)."""
+    raw = [str(args.get(k)) for k in EDIT_PATH_KEYS if args.get(k)]
+    patch = str(args.get("patch") or args.get("patchText") or "")
+    raw += [a or b for a, b in re.findall(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$|^\*\*\* Move to:\s*(.+)$", patch, re.M)]
+    root = Path(session.directory).resolve()
+    out = []
+    for r in raw:
+        p = Path(r.strip())
+        p = (p if p.is_absolute() else root / p).resolve()
+        try:
+            out.append(p.relative_to(root).as_posix())
+        except ValueError:
+            out.append(p.as_posix())
+    return out
+
+
+def _edit_granted(session: Session, args: dict, grants: list) -> bool:
+    """Approving a savvy-flow plan grants edits to the files its tasks own ("edit:<glob>")."""
+    patterns = [g[5:] for g in grants if isinstance(g, str) and g.startswith("edit:")]
+    paths = _edit_paths(session, args)
+    return bool(patterns and paths) and all(any(fnmatch.fnmatch(p, pat) for pat in patterns) for p in paths)
+
+
+def decide(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
+           tool: Optional[ToolDef] = None) -> tuple[str, str]:
+    """(allow | ask | deny, reason) for one tool call.
+
+    Permission modes (Claude Code style): ``ask`` confirms edits, commands, app launches and writes;
+    ``acceptEdits`` applies file edits without asking; ``auto`` asks nothing. Deny rules, the plan
+    agent's read-only restriction and local-only network rules apply in every mode."""
     if not category:
-        return "allow"
+        return "allow", ""
     full = load_config()
     cfg = full["permissions"]
+    mode = permission_mode(full, session.data)
     grants = session.data.get("alwaysAllow", [])
+    override = spec.permissions.get(category)
+    if override == "deny":
+        return "deny", f"{category} actions are not allowed for the {spec.name} agent (read-only)"
+    reason = ""
     if category == "mcp" and tool is not None:
         servers = mcp_tools.session_servers(full, session)
         value = mcp_tools.decision(full, servers, mcp_tools.tool_server(tool, args), mcp_tools.tool_read_only(tool, args), grants)
-        if spec.permissions.get("mcp") in ("deny", "ask") and value != "deny":
-            value = spec.permissions["mcp"]
+        if override == "ask" and value != "deny":
+            value = "ask"
+        if value == "deny":
+            reason = "the MCP server or tool is denied in Settings > MCP"
+    elif category == "bash":
+        command = str(args.get("command") or "")
+        value = permissions.bash_decision(command, cfg.get("bashRules", []), override or cfg.get("bash", "ask"), grants)
+        if value == "deny":
+            return "deny", "a shell deny rule matches this command (Settings > Workspace)"
+        net = full.get("network") or {}
+        kind = permissions.network_kind(command) if net.get("localOnly", True) else None
+        if kind == "network" or (kind == "package" and not net.get("allowPackageManagers", True)):
+            if mode == "auto":
+                return "deny", ("local-only mode: commands that reach the network are never run unattended. Ask the user to run "
+                                "it in the terminal, or to turn local-only mode off in Settings > Privacy & security")
+            return "ask", "network command"
+    elif category == "edit":
+        if cfg.get("edit") == "deny":
+            return "deny", "file edits are denied in Settings > Workspace"
+        # An explicit "allow" in Settings acts like a Claude Code allow rule: edits never ask.
+        granted = "edit" in grants or _edit_granted(session, args, grants) or (cfg.get("edit") == "allow" and not override)
+        value = "allow" if (mode in ("acceptEdits", "auto") or granted) else "ask"
+        if override == "ask" and not granted:
+            value = "ask"
     else:
-        value = spec.permissions.get(category, cfg.get(category, "ask"))
-        if category == "bash":
-            value = permissions.bash_decision(str(args.get("command") or ""), cfg.get("bashRules", []), value, grants)
-        elif value == "ask" and category in grants:
+        value = override or cfg.get(category, "ask")
+        if value == "deny":
+            return "deny", f"{category} is denied in Settings"
+        if value == "ask" and category in grants:
             value = "allow"
-    forced_ask = spec.permissions.get(category) == "ask"
-    if value == "ask" and not forced_ask and auto_mode(full, session.data):
+    if value == "ask" and mode == "auto" and override != "ask":
         value = "allow"
-    return value
+    return value, reason
+
+
+def resolve_permission(session: Session, spec: AgentSpec, category: Optional[str], args: dict,
+                       tool: Optional[ToolDef] = None) -> str:
+    return decide(session, spec, category, args, tool)[0]
 
 
 def _grant_for(tool: ToolDef, args: dict) -> Optional[str]:
@@ -205,14 +270,15 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
         tool = registry.get(call.name)
         if not tool:
             return {"ok": False, "output": f"Unknown or unavailable tool '{call.name}'. Available tools: {', '.join(registry)}"}
-        decision = resolve_permission(session, spec, tool.permission, a, tool)
+        category = tool.dynamic_permission(a) if tool.dynamic_permission else tool.permission
+        decision, reason = decide(session, spec, category, a, tool)
         if decision == "deny":
-            return {"ok": False, "output": (f"Permission denied: this {tool.permission} action is not allowed for the {spec.name} "
-                                            "agent (deny rule or read-only mode). Use another approach.")}
+            return {"ok": False, "output": (f"Permission denied: this {category} action is not allowed for the {spec.name} agent"
+                                            + (f" ({reason})" if reason else " (deny rule or read-only mode)") + ". Use another approach.")}
         if decision == "ask":
             part["status"] = "waiting"
             sink.update_part(msg, part)
-            answer = await ask_permission(session, sink, msg, part, tool.permission, spec.name, _grant_for(tool, a))
+            answer = await ask_permission(session, sink, msg, part, category, spec.name, _grant_for(tool, a))
             if answer == "reject":
                 return {"ok": False, "display": "Rejected by user",
                         "output": "The user rejected this tool call. Do not retry it; adapt your approach or ask the user."}

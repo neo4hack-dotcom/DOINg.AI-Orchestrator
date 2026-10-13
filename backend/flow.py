@@ -34,7 +34,7 @@ from .snapshot import Snapshots
 from .osutil import read_text, run_command, write_text
 from .tools import EDIT_TOOLS, IGNORED_DIRS, READ_ONLY, make_diff
 
-WORKER_TOOLS = READ_ONLY + EDIT_TOOLS + ["bash", "webfetch", "notes", "step"]
+WORKER_TOOLS = READ_ONLY + EDIT_TOOLS + ["bash", "bash_output", "bash_kill", "webfetch", "notes", "step"]
 PHASES = ("plan", "design", "delegate", "review", "verify", "close")
 EXIT_RE = re.compile(r"\[exit code (-?\d+)\]\s*$")
 
@@ -220,6 +220,9 @@ async def run_worker(
         run["status"] = "done"
         run["report"] = report or "(the worker wrote no report)"
     except asyncio.CancelledError:
+        from .processes import manager as processes
+
+        processes.kill_run(run["id"])
         run.update(status="failed", report="Aborted.", endedAt=now_ms())
         emit_run(session, run)
         raise
@@ -227,6 +230,9 @@ async def run_worker(
         run["status"] = "failed"
         run["report"] = f"Worker failed: {e}"
         journal.log(session, "error", agent=run["type"], runId=run["id"], error=str(e)[:300])
+    from .processes import manager as processes
+
+    processes.kill_run(run["id"])  # a worker's dev servers / watchers die with it
     run["verify"] = [{k: v for k, v in r.items() if k != "output"} for r in results]
     run["endedAt"] = now_ms()
     emit_run(session, run)
@@ -563,7 +569,8 @@ class FlowEngine:
         await self.close()
 
     def _grant_plan_commands(self) -> None:
-        """Approving the plan approves the verification commands it lists (no prompt per check)."""
+        """Approving the plan approves the verification commands it lists (no prompt per check) and the edits
+        of the files the tasks own."""
         flow = self.flow
         commands = list(flow.get("verifyCommands", [])) + self.cfg()["verify"].get("commands", [])
         commands += [t.get("verifyCommand", "") for t in flow["tasks"]] + [m.get("verifyCommand", "") for m in flow.get("modules", [])]
@@ -571,6 +578,15 @@ class FlowEngine:
         for cmd in commands:
             for sub in permissions.split_commands(cmd or ""):
                 pattern = glob.escape(sub)
+                if pattern not in grants:
+                    grants.append(pattern)
+        # ... and the edits to the files its tasks own (Ask mode would otherwise confirm each worker edit).
+        for t in flow["tasks"]:
+            for f in t.get("files") or []:
+                f = str(f).strip().lstrip("./").replace("\\", "/")
+                if not f:
+                    continue
+                pattern = f"edit:{f}*" if f.endswith("/") else f"edit:{f}"
                 if pattern not in grants:
                     grants.append(pattern)
 

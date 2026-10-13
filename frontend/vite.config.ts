@@ -6,8 +6,15 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 4000,
-    host: true,
-    proxy: { '/api': { target: 'http://localhost:4001', changeOrigin: true } },
+    host: '127.0.0.1', // never expose the dev UI (and its /api proxy) to the network
+    proxy: {
+      '/api': {
+        target: 'http://localhost:4001',
+        changeOrigin: true,
+        // The API only accepts same-origin writes: present the proxied calls as coming from the API itself.
+        configure: (proxy) => proxy.on('proxyReq', (req) => { if (req.getHeader('origin')) req.setHeader('origin', 'http://localhost:4001'); }),
+      },
+    },
   },
   base: './',
   build: {

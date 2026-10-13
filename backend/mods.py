@@ -50,6 +50,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .config import DATA_DIR, load_config
 from .osutil import atomic_write, read_text
+from .osutil import run_args
 from .osutil import run_command as shell_command
 
 BUILTIN_DIR = Path(__file__).resolve().parent / "builtin" / "mods"
@@ -99,6 +100,7 @@ class Mod:
     option_defaults: dict = field(default_factory=dict)
     option_docs: dict = field(default_factory=dict)
     error: str = ""
+    loaded: bool = True             # False: a user mod not installed yet (its code was not run)
     logs: deque = field(default_factory=lambda: deque(maxlen=80))
     errors: int = 0
 
@@ -181,8 +183,10 @@ class ModRegistry:
     def load_all(self) -> None:
         self.generation += 1
         mods: dict[str, Mod] = {}
+        cfg = load_config()
         for scope, folder in self.folders():
-            mod = self._load(scope, folder)
+            # A user mod's code only runs once it was installed (enabled) by the user or an approved mod_install.
+            mod = self._load(scope, folder, execute=scope == "builtin" or self._user_enabled(folder, cfg))
             if mod.name not in mods:  # a user mod shadows a builtin one of the same name
                 mods[mod.name] = mod
         self.mods = mods
@@ -193,7 +197,16 @@ class ModRegistry:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _load(self, scope: str, folder: Path) -> Mod:
+    @staticmethod
+    def _user_enabled(folder: Path, cfg: dict) -> bool:
+        mc = cfg.get("mods") or {}
+        try:
+            name = str(json.loads(read_text(folder / "mod.json")).get("name") or folder.name)
+        except (OSError, ValueError):
+            return False
+        return name in (mc.get("enabled") or []) and name not in (mc.get("disabled") or [])
+
+    def _load(self, scope: str, folder: Path, execute: bool = True) -> Mod:
         try:
             manifest = json.loads(read_text(folder / "mod.json"))
         except (OSError, json.JSONDecodeError) as e:
@@ -207,8 +220,11 @@ class ModRegistry:
             else:
                 mod.option_defaults[key] = spec
         entry = folder / str(manifest.get("main") or "mod.py")
-        if not entry.is_file():
+        if not entry.is_file() or entry.resolve().parent != folder.resolve():
             mod.error = f"{entry.name} not found"
+            return mod
+        if not execute:
+            mod.loaded = False
             return mod
         module_name = f"supercode_mod_{re.sub(r'[^a-zA-Z0-9_]', '_', name)}_{self.generation}"
         try:
@@ -250,10 +266,12 @@ class ModRegistry:
     def enabled(self, mod: Mod, cfg: Optional[dict] = None) -> bool:
         cfg = cfg or load_config()
         mc = cfg.get("mods") or {}
-        if mod.error:
+        if mod.error or not mod.loaded:
             return False
         if mod.name in (mc.get("disabled") or []):
             return False
+        if mod.scope == "user":  # user mods: only when explicitly installed
+            return mod.name in (mc.get("enabled") or [])
         return mod.default_enabled or mod.name in (mc.get("enabled") or [])
 
     def active(self) -> list[Mod]:
@@ -290,6 +308,7 @@ class ModRegistry:
             out.append({
                 "name": m.name, "version": m.version, "description": m.description, "scope": m.scope, "path": str(m.path),
                 "enabled": self.enabled(m, cfg), "defaultEnabled": m.default_enabled, "error": m.error, "errors": m.errors,
+                "installed": m.loaded,
                 "events": sorted({h.event + (f" {json.dumps(h.matcher)}" if h.matcher else "") for h in m.hooks}),
                 "commands": [{"name": c.name, "description": c.description, "argumentHint": c.argument_hint} for c in m.commands.values()],
                 "tools": [{"name": t.name, "description": t.description} for t in m.tools.values()],
@@ -300,15 +319,49 @@ class ModRegistry:
         return out
 
     def validate(self, folder: Path) -> dict:
-        """Load a mod folder in isolation and report what it registers (or why it fails)."""
+        """Check a mod folder WITHOUT running it: mod.json, Python syntax, register(on, mod), and the events,
+        commands and tools it declares (read from the source). Running it is the install's job."""
         if not (folder / "mod.json").is_file():
             return {"ok": False, "error": "mod.json is missing"}
-        self.generation += 1
-        mod = self._load("user", folder)
-        return {"ok": not mod.error, "error": mod.error, "name": mod.name,
-                "events": [f"{h.event} {json.dumps(h.matcher) if h.matcher else ''}".strip() for h in mod.hooks],
-                "commands": list(mod.commands), "tools": list(mod.tools), "options": mod.option_defaults,
-                "log": [l["text"] for l in mod.logs][-5:]}
+        try:
+            manifest = json.loads(read_text(folder / "mod.json"))
+        except (OSError, json.JSONDecodeError) as e:
+            return {"ok": False, "error": f"mod.json: {e}"}
+        name = str(manifest.get("name") or folder.name)
+        entry = folder / str(manifest.get("main") or "mod.py")
+        if not entry.is_file():
+            return {"ok": False, "error": f"{entry.name} not found", "name": name}
+        import ast
+
+        try:
+            tree = ast.parse(read_text(entry), filename=str(entry))
+        except SyntaxError as e:
+            return {"ok": False, "error": f"SyntaxError line {e.lineno}: {e.msg}", "name": name}
+        if not any(isinstance(n, ast.FunctionDef) and n.name == "register" for n in tree.body):
+            return {"ok": False, "error": "mod.py must define register(on, mod)", "name": name}
+        events, commands, tools = [], [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            fn = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            first = node.args[0].value
+            if fn == "on" and isinstance(first, str):
+                if first not in EVENTS:
+                    return {"ok": False, "error": f"unknown event '{first}' (known: {', '.join(EVENTS)})", "name": name}
+                matcher = ""
+                if len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+                    try:
+                        matcher = " " + json.dumps(ast.literal_eval(node.args[1]))
+                    except ValueError:
+                        matcher = " {...}"
+                events.append(first + matcher)
+            elif fn == "command" and isinstance(first, str):
+                commands.append(first)
+            elif fn == "tool" and isinstance(first, str):
+                tools.append(first)
+        return {"ok": True, "error": "", "name": name, "events": events, "commands": commands, "tools": tools,
+                "options": {k: (v.get("default") if isinstance(v, dict) else v) for k, v in (manifest.get("options") or {}).items()},
+                "log": []}
 
 
 registry = ModRegistry()
@@ -412,8 +465,14 @@ class ModContext:
 
     # -- capabilities --------------------------------------------------------
     async def run(self, command: str, timeout: int = 60, cwd: Optional[str] = None) -> tuple[int, str]:
+        """A fixed shell command line. Never interpolate file names or other data into it: use exec()."""
         code, out, _timed_out = await shell_command(command, cwd or self.directory, timeout)
         return code, out
+
+    async def exec(self, args: list, timeout: int = 60, cwd: Optional[str] = None) -> tuple[int, str]:
+        """Run a program with an argument list, without a shell (safe with any file or branch name)."""
+        code, out, timed_out = await run_args([str(a) for a in args], cwd or self.directory, timeout)
+        return code, out + ("\n[timed out]" if timed_out else "")
 
     def path(self, rel: str) -> Path:
         p = Path(rel)

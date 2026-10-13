@@ -31,21 +31,21 @@ def _json(ctx, path):
 async def _ruff(ctx, path):
     if not ctx.which("ruff"):
         return []
-    code, out = await ctx.run(f'ruff check --output-format concise --select E9,F63,F7,F82 --no-cache "{path}"', timeout=30)
+    code, out = await ctx.exec(["ruff", "check", "--output-format", "concise", "--select", "E9,F63,F7,F82", "--no-cache", "--", path], timeout=30)
     return [l for l in out.splitlines() if re.match(r"^.+:\d+:\d+:", l)] if code != 0 else []
 
 
 async def _node(ctx, path):
     if not ctx.which("node"):
         return []
-    code, out = await ctx.run(f'node --check "{path}"', timeout=30)
+    code, out = await ctx.exec(["node", "--check", path], timeout=30)
     return [out.strip()[:800]] if code != 0 and out.strip() else []
 
 
 async def _tsc(ctx, paths):
     if not (ctx.exists("tsconfig.json") and ctx.exists("node_modules/typescript")):
         return []
-    code, out = await ctx.run("npx --no-install tsc --noEmit --pretty false -p .", timeout=int(ctx.options.get("timeout") or 90))
+    code, out = await ctx.exec(["npx", "--no-install", "tsc", "--noEmit", "--pretty", "false", "-p", "."], timeout=int(ctx.options.get("timeout") or 90))
     if code == 0:
         return []
     wanted = {p.replace("\\", "/") for p in paths}

@@ -248,19 +248,20 @@ def _announce_project_servers(session, cfg: dict, notify) -> None:
     fresh = [n for n in pending if n not in seen]
     if fresh:
         seen.extend(fresh)
-        notify(f"This project's .mcp.json declares MCP server(s) {', '.join(fresh)}. They will not start until you approve them "
-               "(Settings > MCP, or the MCP chip above the prompt).")
+        notify(f"This project's .mcp.json declares (or changed) MCP server(s) {', '.join(fresh)}. They will not start until you "
+               "approve them (Settings > MCP, or the MCP chip above the prompt).")
 
 
 def pending_project_servers(cfg: dict, directory: str) -> list[str]:
     from pathlib import Path
 
-    approved = set(cfg["mcp"].get("approvedProjectServers") or [])
+    from .mcp_client import project_approval
+
     try:
-        root = str(Path(directory).resolve())
+        servers = project_servers(directory)
     except OSError:
         return []
-    return [n for n in project_servers(directory) if f"{root}::{n}" not in approved and n not in cfg["mcp"]["servers"]]
+    return [n for n, s in servers.items() if n not in cfg["mcp"]["servers"] and project_approval(cfg, directory, n, s) != "approved"]
 
 
 def parse_import(text: str) -> dict[str, dict]:

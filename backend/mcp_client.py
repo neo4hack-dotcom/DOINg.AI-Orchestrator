@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from . import netguard
 from .osutil import IS_WINDOWS, kill_tree
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -208,7 +209,7 @@ class HttpTransport(_Transport):
         self._tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=15), follow_redirects=True)
+        self.client = netguard.client(timeout=httpx.Timeout(self.timeout, connect=15), follow_redirects=True)
 
     def _headers(self) -> dict:
         h = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json", **self.headers}
@@ -293,7 +294,7 @@ class SseTransport(_Transport):
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=15), follow_redirects=True)
+        self.client = netguard.client(timeout=httpx.Timeout(None, connect=15), follow_redirects=True)
         self._task = asyncio.create_task(self._listen())
         try:
             await asyncio.wait_for(self._ready.wait(), 20)
@@ -594,13 +595,29 @@ def project_servers(directory: str) -> dict[str, dict]:
     return out
 
 
+def project_key(directory: str, name: str, server: dict) -> str:
+    """Approval key of a project server: folder + name + a hash of its whole definition (command, args,
+    env, cwd, url, headers). Any change to .mcp.json needs a new approval."""
+    definition = {k: v for k, v in server.items() if k not in ("enabled", "permission", "trustReadOnly", "source")}
+    digest = hashlib.sha256(json.dumps(definition, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return f"{Path(directory).resolve()}::{name}::{digest}"
+
+
+def project_approval(cfg: dict, directory: str, name: str, server: dict) -> str:
+    """approved | changed (approved before, definition modified since) | pending."""
+    approved = set((cfg.get("mcp") or {}).get("approvedProjectServers") or [])
+    if project_key(directory, name, server) in approved:
+        return "approved"
+    prefix = f"{Path(directory).resolve()}::{name}::"
+    return "changed" if any(a.startswith(prefix) or a == prefix[:-2] for a in approved) else "pending"
+
+
 def effective_servers(cfg: dict, directory: str) -> dict[str, dict]:
     """Global servers + approved project servers, enabled only."""
     mcp_cfg = cfg.get("mcp") or {}
     servers = {n: {**s, "source": "user"} for n, s in (mcp_cfg.get("servers") or {}).items() if s.get("enabled", True)}
-    approved = set(mcp_cfg.get("approvedProjectServers") or [])
     for name, s in project_servers(directory).items():
-        if f"{Path(directory).resolve()}::{name}" in approved and name not in servers and s.get("enabled", True):
+        if name not in servers and s.get("enabled", True) and project_approval(cfg, directory, name, s) == "approved":
             servers[name] = s
     return servers
 

@@ -47,6 +47,32 @@ def _protected(ctx, path):
     return None
 
 
+DANGEROUS_TARGETS = {"/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "${HOME}", "*", ".", "./", "..", "../", "/home", "/usr", "/etc",
+                     "/var", "/boot", "/root", "c:\\", "c:/", "c:"}
+
+
+def _rm_danger(command):
+    """rm with recursive + force flags in any spelling (-rf, -r -f, -fR, --recursive --force) on a dangerous target."""
+    import shlex
+
+    for sub in re.split(r"\s*(?:&&|\|\||;|\||\n)\s*", command):
+        try:
+            words = shlex.split(sub)
+        except ValueError:
+            words = sub.split()
+        while words and words[0] in ("sudo", "doas", "command", "builtin", "nice", "nohup"):
+            words = words[1:]
+        if not words or words[0] not in ("rm", "/bin/rm", "/usr/bin/rm"):
+            continue
+        flags = "".join(w[1:] for w in words[1:] if w.startswith("-") and not w.startswith("--"))
+        longs = {w for w in words[1:] if w.startswith("--")}
+        recursive = "r" in flags.lower() or "--recursive" in longs
+        targets = [w for w in words[1:] if not w.startswith("-")]
+        if recursive and any(t.rstrip("/") in {x.rstrip("/") for x in DANGEROUS_TARGETS} or t in DANGEROUS_TARGETS for t in targets):
+            return True
+    return False
+
+
 def check_command(ctx, command):
     for pat in ctx.options.get("allowPatterns") or []:
         try:
@@ -54,6 +80,9 @@ def check_command(ctx, command):
                 return None
         except re.error:
             continue
+    if _rm_danger(command):
+        return "recursive delete of the root, home, current or parent folder"
+    command = re.sub(r"[ \t]+", " ", command)
     rules = DANGEROUS + [(p, "blocked by your extraBlocked rule") for p in (ctx.options.get("extraBlocked") or [])]
     for pat, why in rules:
         try:

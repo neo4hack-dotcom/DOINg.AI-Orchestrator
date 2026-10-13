@@ -217,7 +217,7 @@ async def test_pull_request_existing_and_errors(client, fake_server, bitbucket_s
     assert bad.status_code == 400 and "both" in bad.json()["detail"]
 
 
-async def test_cors_only_allows_local_dev_origins():
+async def test_no_cross_origin_reads():
     import httpx
 
     from backend.main import app
@@ -226,4 +226,4 @@ async def test_cors_only_allows_local_dev_origins():
         evil = await c.options("/api/config", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "PUT"})
         assert evil.headers.get("access-control-allow-origin") is None
         dev = await c.options("/api/config", headers={"Origin": "http://localhost:4000", "Access-Control-Request-Method": "PUT"})
-        assert dev.headers.get("access-control-allow-origin") == "http://localhost:4000"
+        assert dev.headers.get("access-control-allow-origin") is None  # the dev UI goes through the Vite proxy

@@ -330,6 +330,8 @@ def save(scope: str, name: str, content: str, directory: Optional[str], files: O
         raise ValueError("; ".join(errors))
     root = root_for(scope, directory)
     folder = root / str(meta["name"])
+    if rename_from and not NAME_RE.match(rename_from):
+        raise ValueError("Invalid skill name to rename")
     if rename_from and rename_from != meta["name"]:
         old = root / rename_from
         if folder.exists():

@@ -29,19 +29,19 @@ def pick(ctx, path):
     """(formatter name, command) for this file, or None."""
     ext = os.path.splitext(path)[1].lower()
     only = ctx.options.get("onlyConfigured", True)
-    quoted = f'"{path}"'
+    # Argument lists (no shell): a file name can never be read as shell syntax.
     if ext in PRETTIER_EXT and ctx.exists("node_modules/prettier") and (not only or _prettier_configured(ctx)):
-        return "prettier", f"npx --no-install prettier --write --log-level warn {quoted}"
+        return "prettier", ["npx", "--no-install", "prettier", "--write", "--log-level", "warn", "--", path]
     if ext in (".py", ".pyi"):
         py = _pyproject(ctx)
         if ctx.which("ruff") and (not only or "[tool.ruff" in py or ctx.exists("ruff.toml") or ctx.exists(".ruff.toml")):
-            return "ruff", f"ruff format --quiet {quoted}"
+            return "ruff", ["ruff", "format", "--quiet", "--", path]
         if ctx.which("black") and (not only or "[tool.black" in py):
-            return "black", f"black --quiet {quoted}"
+            return "black", ["black", "--quiet", "--", path]
     if ext == ".go" and ctx.which("gofmt"):
-        return "gofmt", f"gofmt -w {quoted}"
+        return "gofmt", ["gofmt", "-w", path]
     if ext == ".rs" and ctx.which("rustfmt") and (not only or ctx.exists("rustfmt.toml") or ctx.exists(".rustfmt.toml") or ctx.exists("Cargo.toml")):
-        return "rustfmt", f"rustfmt --edition 2021 {quoted}"
+        return "rustfmt", ["rustfmt", "--edition", "2021", path]
     return None
 
 
@@ -58,7 +58,7 @@ def register(on, mod):
                 continue
             name, command = choice
             before = ctx.read(path)
-            code, out = await ctx.run(command, timeout=int(ctx.options.get("timeout") or 60))
+            code, out = await ctx.exec(command, timeout=int(ctx.options.get("timeout") or 60))
             if code != 0:
                 ctx.log(f"{name} failed on {path}: {out[-400:]}", "warning")
                 continue

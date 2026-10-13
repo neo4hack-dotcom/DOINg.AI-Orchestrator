@@ -63,7 +63,9 @@ Edit tools put the changed paths in `result["metadata"]["files"]`; bash results 
 - `ctx.state` - dict persisted with the session; `ctx.store` - dict persisted across sessions.
 - `ctx.options` - the mod's options; `ctx.session` - {id, title, directory, agent, model, contextTokens,
   contextWindow, tokens, autoMode, flow, busy}; `ctx.directory`.
-- `await ctx.run("command", timeout=60)` -> `(exit_code, output)` in the project folder (bash / PowerShell).
+- `await ctx.exec(["git", "add", path], timeout=60)` -> `(exit_code, output)`: a program with an argument list, no shell.
+  ALWAYS use it when a file name, branch name or any data goes into the command.
+- `await ctx.run("git status --short", timeout=60)` -> the same through the shell (bash / PowerShell), for fixed command lines only.
 - `ctx.read(path)`, `ctx.exists(path)`, `ctx.path(path)` (project-relative), `ctx.which("prettier")`.
 - `await ctx.llm(prompt, system="", json_mode=False)` -> text from the configured local model.
 - `ctx.log(text)` (Settings > Mods > logs), `ctx.journal(kind, **data)` (session journal / report).

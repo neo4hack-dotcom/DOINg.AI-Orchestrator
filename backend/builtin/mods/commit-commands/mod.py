@@ -66,7 +66,7 @@ def register(on, mod):
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(message + "\n")
-            code, out = await ctx.run(f'git commit -F "{path}"', timeout=120)
+            code, out = await ctx.exec(["git", "commit", "-F", path], timeout=120)
         finally:
             try:
                 os.unlink(path)
@@ -89,7 +89,7 @@ def register(on, mod):
         gone = [l[2:].split()[0] for l in branches.splitlines() if ": gone]" in l and not l.startswith("*")]
         deleted, failed = [], []
         for b in gone:
-            code, out = await ctx.run(f'git branch -D "{b}"', timeout=20)
+            code, out = await ctx.exec(["git", "branch", "-D", "--", b], timeout=20)
             (deleted if code == 0 else failed).append(b)
         if not gone:
             return {"text": "No local branch has a deleted remote."}
