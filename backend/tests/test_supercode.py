@@ -143,6 +143,21 @@ def test_parse_remote(url, expected):
     assert (r["kind"], r["project"], r["repo"], r["baseUrl"]) == expected
 
 
+@pytest.mark.parametrize("url,host", [
+    ("https://bitbucket.company.com/scm/PROJ/r.git", "bitbucket.company.com"),
+    ("ssh://git@bb.corp:7999/proj/r.git", "bb.corp"),
+    ("git@bitbucket.org:acme/web.git", "bitbucket.org"),
+    ("bb.corp:proj/r.git", "bb.corp"),
+    ("C:/Users/me/remote.git", ""),       # Windows paths are local, not an scp-like host "C"
+    ("C:\\Users\\me\\remote.git", ""),
+    ("/srv/git/remote.git", ""),
+    ("file:///C:/repos/remote.git", ""),
+    ("../remote.git", ""),
+])
+def test_remote_host(url, host):
+    assert bitbucket._remote_host(url) == host
+
+
 def _git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 

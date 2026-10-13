@@ -377,7 +377,7 @@ Settings and sessions live in `data/` (`ORCH_DATA_DIR` to move it). No cross-ori
 
 ```bash
 pip install -r requirements.txt
-python -m pytest            # 130 tests: editing, patches, permissions, planner, snapshots, compaction,
+python -m pytest            # 139 tests: editing, patches, permissions, planner, snapshots, compaction,
                             # retries, overflow, auto-fix, budget, crash resume, undo/fork, goal,
                             # modular flow, parallel waves, auto mode, projects, Bitbucket Server + Cloud,
                             # CRLF, process trees, shells, MCP (stdio, HTTP, tool search, permissions,

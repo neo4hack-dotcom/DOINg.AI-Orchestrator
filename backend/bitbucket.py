@@ -62,8 +62,12 @@ async def git(directory: str, *args: str, stdin: Optional[bytes] = None, timeout
 
 
 def _remote_host(url: str) -> str:
-    """Host of an https:// or ssh (git@host:path, ssh://) git remote."""
-    m = re.match(r"^[\w+.-]+://(?:[^@/]+@)?([^/:]+)", url) or re.match(r"^(?:[^@]+@)?([^:/]+):", url)
+    """Host of an https:// or ssh (git@host:path, ssh://) git remote; "" for a local path (/srv/repo.git,
+    C:/repo.git, C:\\repo.git, ./repo, file://) - git reads a drive letter as a path, not as an scp-like host."""
+    url = (url or "").strip()
+    if re.match(r"^[A-Za-z]:[\\/]", url) or url.startswith(("/", "\\", ".", "~", "file:")):
+        return ""
+    m = re.match(r"^[\w+.-]+://(?:[^@/]+@)?([^/:]+)", url) or re.match(r"^(?:[^@/]+@)?([^:/\\]+):", url)
     return m.group(1) if m else ""
 
 
