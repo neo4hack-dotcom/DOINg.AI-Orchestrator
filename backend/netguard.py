@@ -111,6 +111,9 @@ def describe(cfg: dict) -> list[dict]:
 
     llm = cfg.get("llm") or {}
     add("llm", f"LLM ({llm.get('provider')})", llm.get("baseUrl") or "")
+    if ((cfg.get("permissions") or {}).get("webfetch") or "ask") != "deny":
+        out.append({"kind": "webfetch", "name": "webfetch tool (agents)", "url": "", "local": local_only(cfg), "blocked": False,
+                    "note": "local and private-network URLs only" if local_only(cfg) else "any URL the agents decide to fetch"})
     for name, srv in ((cfg.get("mcp") or {}).get("servers") or {}).items():
         if srv.get("url") and srv.get("enabled", True):
             add("mcp", f"MCP server {name}", srv["url"])

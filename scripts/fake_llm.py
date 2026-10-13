@@ -137,7 +137,14 @@ def brain(messages: list[dict]) -> tuple[str, list[dict]]:
     last = messages[-1] if messages else {}
     after_tool = last.get("role") == "tool" or str(last.get("content", "")).startswith("<tool_result")
     if not after_tool:
-        if re.search(r"\brun\b", last_user.lower()) and "READ-ONLY" not in system:
+        low = last_user.lower()
+        if "create notes.md" in low and "READ-ONLY" not in system:
+            return "Creating it.", [{"name": "write", "arguments": {"path": "notes.md", "content": "# Notes\n\n- written by the agent\n"}}]
+        if "sales by region" in low:
+            return "Querying the data.", [{"name": "data_query", "arguments": {
+                "source": "file:sales.csv", "sql": "SELECT region, SUM(sales) AS total FROM sales GROUP BY region ORDER BY total DESC",
+                "title": "Sales by region"}}]
+        if re.search(r"\brun\b", low) and "READ-ONLY" not in system:
             return "Running it.", [{"name": "bash", "arguments": {"command": "printf 'hello from bash\\n'"}}]
         return ("<think>The user wants to know about the workspace. Listing it is the cheapest first step; "
                 "then I can answer precisely.</think>I'll look around first."), [{"name": "list", "arguments": {"path": "."}}]

@@ -4,7 +4,9 @@
 
 - **OpenCode agents**: `Build` (reads, edits, runs commands) and `Plan` (read-only); `Tab` switches.
 - **savvy-flow** (`/flow <task>`): the orchestrator splits the work into homogeneous modules and tasks, runs tiered workers in parallel (`fable` / `heavy` / `careful` / `medium` / `light`), verifies and reviews every result adversarially, and closes with project-wide checks.
-- **Auto mode**: no human in the loop. Plans are approved automatically, permissions are granted (deny rules still apply), and the agents answer their own questions with stated assumptions.
+- **Permission modes like Claude Code**: **Ask** (edits, commands, app launches and data writes are confirmed, with a preview of the diff / command / SQL), **Accept edits** (file edits apply directly) and **Auto** (no human in the loop: plans approved, permissions granted except deny rules, the agents answer their own questions). `Shift+Tab` cycles.
+- **Terminal, files and preview**: an integrated terminal (`` Ctrl+` ``) where you and the agents run commands and dev servers, `!command` shell mode, a file explorer and editor, open-with-the-system-app, and a **live preview** of the app being built (local dev servers or workspace HTML).
+- **Data analysis add-in**: connect databases through the MCP servers you configured (PostgreSQL, SQLite, MySQL, DuckDB…) or open SQLite / CSV / XLSX / JSON files, browse tables, write SQL, filter / sort / profile / chart in a grid, export **CSV or Excel** - and ask the agent to do any of it from the chat.
 - **Projects anywhere**: create a new project folder or open an existing one with a built-in folder browser (drives on Windows, recent projects).
 - **Bitbucket pull requests** from the app: branch, commit, push and PR to **Bitbucket Server / Data Center** (enterprise, self-hosted) or **Bitbucket Cloud**, manually (`/pr`) or automatically at the end of a flow.
 - **Full traceability**: a journal of every tool call and decision, a Markdown report, `docs/PLAN.md` and `docs/FLOW_REPORT.md`, git snapshots with undo.
@@ -14,7 +16,7 @@
 - **Mods**: Claude Code-style hooks on the agent's events, created by asking (`/mod <description>`), with the **top 5** built in: status line, format-on-edit, safety guard, diagnostics, commit commands.
 - **Reverse engineering layer** (optional): [REA](https://github.com/morluto/rea)'s MCP server and skill, gated behind a responsible-use acknowledgement.
 - **Windows, macOS and Linux**: tested on all three in CI.
-- **100% local**: no telemetry. Providers: **Ollama**, **OpenAI-compatible** servers (LM Studio, vLLM, llama.cpp, LocalAI…) and **n8n** webhooks.
+- **100% local, audited**: no telemetry, no cloud service; **local-only mode** (on by default) refuses any request the app would make to the internet, and Settings → **Privacy & security** lists every destination your data can reach. See [`SECURITY.md`](SECURITY.md). Providers: **Ollama**, **OpenAI-compatible** servers (LM Studio, vLLM, llama.cpp, LocalAI…) and **n8n** webhooks.
 
 ---
 
@@ -66,18 +68,51 @@ Development with hot reload: `start-dev.bat`, or `python server.py` plus `cd fro
 
 Agents can never read or write outside the session folder.
 
-## Auto mode
+## Permission modes
 
-Turn it on for a whole installation (Settings → Workspace → *Auto mode by default*), per project (checkbox in the project dialog), or per session (the **Auto** chip under the prompt, `/auto`). In auto mode:
+The chip under the prompt shows the session's mode; click it or press `Shift+Tab` to cycle. The default for new sessions is in Settings → Workspace; a project can start in Auto from the project dialog.
 
-| Usually asks you | In auto mode |
-| --- | --- |
-| Approve the savvy-flow plan | approved automatically |
-| Orchestrator questions about the request | the orchestrator answers them itself, listing its assumptions in the plan |
-| `question` tool | answered with "choose the most reasonable option and state your assumption" |
-| Permission prompts (shell, edits, web) | granted; **deny rules still apply** (`git push*`, `sudo *`, `rm -rf /*`, `rd /s*`, `format *`…) |
+| Action of an agent | **Ask** (default) | **Accept edits** | **Auto** |
+| --- | --- | --- | --- |
+| Read, search, list files | runs | runs | runs |
+| Create / edit / delete files | asks, with the diff or the new content | runs | runs |
+| Shell command (`bash`) | asks (allow rules such as `git status*` run directly) | asks | runs |
+| Command that reaches the network (`curl`, `git push`, `ssh`…) with local-only on | asks, with the reason | asks | **refused** (never unattended) |
+| Open a file / app with the system (`open`) | asks | asks | runs |
+| SQL that changes data (`INSERT`, `UPDATE`, `DELETE`, DDL…) | asks, with the SQL | asks | runs |
+| Approve the savvy-flow plan, answer questions | you | you | automatic, assumptions stated |
+| Deny rules (`git push*`, `sudo *`, `rm -rf /*`…), plan agent read-only, sandbox | apply | apply | apply |
 
-The agents' system prompts also say no human is watching, so they never stop to wait. Combine with a token budget (Settings → Flow) for unattended nights.
+Every prompt offers *Allow once*, *Always (this session)* - remembered per command pattern (`npm test*`), per file glob or per category - and *Reject*. Switching to a more permissive mode while a prompt is open approves it if the new mode would not ask. Settings → Workspace sets each category (*allow* / *ask* / *deny*) and the shell rules. In Auto, the agents' system prompts say no human is watching, so they never stop to wait; combine it with a token budget (Settings → Flow) for unattended nights.
+
+## Terminal, files and preview
+
+- **Terminal** (`` Ctrl+` ``, header button, `/terminal`): run any command in the project folder (`cd` is remembered), output streams live, send input to a running program, `Ctrl+C` / stop, several processes in tabs. Background processes the agents start (`bash` with `run_in_background`, e.g. a dev server) appear there too, with a robot icon; the agents read their output (`bash_output`) and stop them (`bash_kill`).
+- **Shell mode**: start a prompt with `!` (`!npm test`) - the command runs right away (not through the agent) and its output is shared with the agent on your next message, like Claude Code's `!`.
+- **Files** tab: the project tree (new file / folder, dot files), click to open the **editor** (line numbers, edit and `Ctrl+S` with conflict detection, Markdown / HTML / image / PDF preview, *open with the system app*, *mention in the chat*, open data files in the Data view). The *Changes* view keeps the per-file diffs and one-click restore. File cards in the chat open the file at the right line.
+- **Preview** tab: the app you are building, live. URLs printed by dev servers (`http://localhost:5173`) are detected and listed; workspace HTML files are served sandboxed; desktop / tablet / mobile widths, reload, wide panel. The agents can show you something with the `show` tool (a file at a line, or a local URL in the preview) and open files or apps with the system (`open`, which asks in Ask mode).
+
+## Data analysis
+
+Header **Data** button or `/data` opens the data workspace:
+
+- **Sources**: every MCP server you configured that has a SQL query tool (PostgreSQL, SQLite, MySQL, DuckDB, ClickHouse… - detected from the tool names and schemas), plus the SQLite databases and CSV / TSV / JSON / JSONL / XLSX files of the project (loaded into an in-memory SQLite table so you can query them in SQL). Click a source to list its tables, a table to open it.
+- **SQL editor** (`Ctrl+Enter`), query history; statements that change data ask for confirmation unless the session is in Auto mode.
+- **Grid**: search, filters (= ≠ contains, > <, empty, in, regex…; right-click a cell to filter on its value or exclude it), sort (Shift+click for several keys), hide columns, select rows, copy as TSV, pagination; **Profile** (types, empties, distinct, min / max / mean / median, top values, duplicates) and **Chart** (count / sum / avg / min / max by a column, bars or line).
+- **Export** the current view - or every row with Shift - to **CSV** (UTF-8 BOM, Excel-safe), **Excel (.xlsx)** or JSON.
+- **The agent sees the same tables**: the chat strip at the bottom sends your request with the dataset and its view as context ("only the rows of 2024, sorted by revenue", "check for duplicates", "write the SQL for the monthly totals"). The agent uses `data_sources`, `data_query`, `data_view` (changes what you see in the grid), `data_profile` and `data_export`; its query results also show as small tables in the chat with *Open in the Data view*. Only the first rows of a result go to the LLM (Settings → Workspace → *Rows the agent sees*); everything else stays in the app.
+
+## Privacy & security
+
+The app has **no telemetry and no cloud service**: your code, prompts and data only go to the endpoints you configure. Settings → **Privacy & security** shows them all with their status, and the security checks in force:
+
+- **Local-only mode** (default): every HTTP request the app makes - LLM, MCP servers over HTTP, `webfetch`, Bitbucket - is checked (redirects included) and refused unless it goes to this machine or a private network. Shell commands that reach the network always ask first and never run unattended in Auto mode; package installs can be allowed or not.
+- **The server** listens on `127.0.0.1` only; it rejects requests whose `Host` is not this machine (DNS rebinding) and unsafe requests from other origins (CSRF), so a web page open in your browser cannot drive the agents. To use it from another machine, `python server.py --host 0.0.0.0`: an access token is then required (generated and printed, or `--token <secret>`).
+- **The agents' sandbox**: no file access outside the project, never the app's own data folder (settings with secrets, sessions), `.git` read-only, symlinks pointing outside skipped, executables never opened with the system.
+- **Secrets** (LLM key, Bitbucket token, MCP env / headers / URL credentials / command-line keys) are masked in the UI and never sent back to the browser.
+- **MCP servers** declared by a project stay inert until approved, and any change to their definition needs a new approval; user mods only load once installed.
+
+The audit, the data flows and the residual risks are documented in [`SECURITY.md`](SECURITY.md).
 
 ## Bitbucket pull requests
 
@@ -104,6 +139,9 @@ Then **Test Bitbucket**. From a session, open the **Git** tab (or `/pr`):
 | --- | --- |
 | `Enter` / `Shift+Enter` | send / new line (while the agent works, the message is **queued**) |
 | `Tab` | Build → Plan → Savvy Flow |
+| `Shift+Tab` | permission mode: Ask → Accept edits → Auto |
+| `!command` | shell mode: run a command now, share its output with the agent |
+| `` Ctrl+` `` | terminal |
 | `↑` / `↓` | prompt history (drafts kept per session) |
 | `Esc` | interrupt |
 | `@path` | attach a file (autocomplete) |
@@ -112,7 +150,8 @@ Then **Test Bitbucket**. From a session, open the **Git** tab (or `/pr`):
 | `/goal <condition>` | goal mode: keep working until an evaluator confirms the condition |
 | `/pr` | Bitbucket pull request |
 | `/undo` | undo the last turn (files **and** conversation, via git snapshot) |
-| `/auto` · `/compact` · `/fork` · `/report` | auto mode · summarize the context · branch the session · download the report |
+| `/auto` · `/compact` · `/fork` · `/report` | auto mode on / off · summarize the context · branch the session · download the report |
+| `/terminal` · `/files` · `/preview` · `/data` | terminal · file explorer · live preview · data analysis |
 | `/activity` | every reasoning step, the plan, tests and actions; **Export PDF** |
 | `/<skill-name> <args>` | run a skill (e.g. `/code-review src/`, `/systematic-debugging <error>`) |
 | `/mod <description>` · `/skill-new <need>` | the agent writes and installs a mod · writes a skill |
@@ -123,7 +162,7 @@ Then **Test Bitbucket**. From a session, open the **Git** tab (or `/pr`):
 
 `/init` creates or updates `AGENTS.md`; that file (or `CLAUDE.md`) is injected into every agent's prompt.
 
-**Permissions** (when auto mode is off): file edits allowed, shell on request (*once* / *always*, remembered per command pattern like `npm test*` / *reject*). **Shell rules** (`git status* = allow`, `git push* = deny`…) apply per sub-command (`&&`, `;`, `|`). Approving a plan pre-approves its verification commands.
+**Permissions**: see [Permission modes](#permission-modes). **Shell rules** (`git status* = allow`, `git push* = deny`…) apply per sub-command (`&&`, `;`, `|`); an *allow* rule never covers a command with substitutions, redirections or exec-style options (`$(…)`, `> file`, `find -exec`, `git -c`…). Approving a plan pre-approves its verification commands and the edits of its task files.
 
 ## Thinking, activity and the PDF report
 
@@ -266,17 +305,18 @@ Plus: session fork, manual compaction, system prompts with a stable prefix (KV-c
 1. **Command palette** (`Ctrl+K`): commands, panels, sessions.
 2. **Message queue**: type while the agent works; sent as soon as it is free.
 3. **Prompt history** (`↑/↓`) and per-session drafts.
-4. **Side panel tabs**: *Agents* (savvy-progress), *Plan* (modules, waves, critical path, checks, tokens and time per task), *Files*, *Git*, *Trace*.
+4. **Side panel tabs**: *Agents* (savvy-progress), *Plan* (modules, waves, critical path, checks, tokens and time per task), *Files* (explorer + changes), *Preview*, *Git*, *Trace*, *Mods*.
 5. **Changed files**: per-file diff and one-click restore.
 6. **Trace**: live, filterable journal (decisions, tools, errors) and report export.
 7. **Desktop notifications** and tab badge (permission, question, flow done).
 8. **Grouped tool calls**, "jump to latest", scrolling that stays pinned.
-9. **Status bar**: context gauge, tokens, compactions, goal, **Auto** switch.
+9. **Status bar**: context gauge, tokens, compactions, goal, **permission mode** chip.
 10. **Message actions**: copy, retry, edit and resend, fork from here; clickable answers to agent questions.
 11. **Thinking cards**: live shimmer and preview, then a "Thought for Ns · steps" timeline.
 12. **Activity view** with filters and **Export PDF / Markdown**.
 13. **Slash menu** with the app's commands, mod commands and skills; **MCP chip** to switch servers per session.
 14. **Mod status line** under the prompt, mod **bands** with buttons above it, **toasts**, and a **Mods** side-panel tab.
+15. **Terminal** panel (resizable), **file editor**, **live preview**, **Data view**; permission prompts with the diff, the new file, the command or the SQL, and why it asks.
 
 ## Windows notes
 
@@ -296,16 +336,16 @@ python scripts/fake_llm.py --port 11500 --no-tools          # forces the text pr
 python scripts/fake_llm.py --port 11500 --plan-mode modular # modular plans
 ```
 
-Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-coder:7b`.
+Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-coder:7b`. Try "run the tests", "create notes.md" (a permission prompt in Ask mode) or, with a `sales.csv` in the project, "show me sales by region" (a query result in the chat and the Data view).
 
 ## Architecture
 
 ```
  Browser ── React 19 · Vite · Tailwind ────────────────────────────────────────┐
  │ Sessions │ Transcript (thinking, text, tools, diffs, plan, │ Agents · Plan ·   │
- │          │ reviews) · savvy-progress bar · questions ·     │ Files · Git ·     │
- │          │ permissions · mod band · prompt · status line   │ Trace · Mods      │
- │ Activity view (PDF export) · Settings: LLM … MCP · Skills · Mods · Reverse   │
+ │          │ reviews, data tables) · progress · questions ·  │ Files · Preview · │
+ │          │ permissions · mod band · prompt · terminal      │ Git · Trace · Mods│
+ │ Activity (PDF) · Data view · file editor · Settings: … Privacy · MCP · Mods  │
  └──────────────── REST /api/*  +  SSE /api/sessions/{id}/events ───────────────┘
                                    │
  FastAPI (server.py → backend/) ───┴──────────────────────────────────────────────┐
@@ -313,6 +353,10 @@ Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-co
  │ flow.py       savvy-flow: plan → design → delegate → review → verify → close  │
  │ planner.py    decomposition: modules, DAG, conflicts, waves, critical path    │
  │ tools.py      read/edit/multiedit/apply_patch/bash/repomap/... (sandboxed)     │
+ │ processes.py  terminal + background processes (live output, URLs, stdin)      │
+ │ workspace_api terminal, ! shell, file tree / editor, raw files, preview       │
+ │ data.py       data add-in: sources, SQL, datasets, views, exports, data tools │
+ │ netguard.py   local-only mode for every outbound request · security.py guard │
  │ bitbucket.py  branch, commit, push, pull request (Server / Cloud)            │
  │ extensions.py what MCP, skills and mods add to each agent run                 │
  │ mcp_client.py MCP protocol client (stdio, Streamable HTTP, SSE) + manager     │
@@ -327,18 +371,21 @@ Then Settings → Local LLM → Ollama, `http://localhost:11500`, model `fake-co
                      your local LLM (as in NEXUS.AI)
 ```
 
-Settings and sessions live in `data/` (`ORCH_DATA_DIR` to move it). Cross-origin requests are only accepted from the dev UI on :4000 (add origins with `ORCH_CORS_ORIGINS`): another web page open in your browser cannot send JSON requests to the API to drive the agent or install a mod. See [`filemap.md`](filemap.md) for every file.
+Settings and sessions live in `data/` (`ORCH_DATA_DIR` to move it). No cross-origin request is accepted (the dev UI goes through Vite's proxy; add origins with `ORCH_CORS_ORIGINS` if you really need to): another web page open in your browser cannot drive the agents or install a mod. See [`filemap.md`](filemap.md) for every file and [`SECURITY.md`](SECURITY.md) for the security model.
 
 ## Tests and CI
 
 ```bash
 pip install -r requirements.txt
-python -m pytest            # 97 tests: editing, patches, permissions, planner, snapshots, compaction,
+python -m pytest            # 130 tests: editing, patches, permissions, planner, snapshots, compaction,
                             # retries, overflow, auto-fix, budget, crash resume, undo/fork, goal,
                             # modular flow, parallel waves, auto mode, projects, Bitbucket Server + Cloud,
                             # CRLF, process trees, shells, MCP (stdio, HTTP, tool search, permissions,
                             # project approval; official SDK interop when `pip install mcp`), skills,
-                            # mods (top 5, user mods, /mod builder, /commit), reasoning, activity + PDF
+                            # mods (top 5, user mods, /mod builder, /commit), reasoning, activity + PDF,
+                            # permission modes, local-only, HTTP guard, terminal / ! shell / background
+                            # processes, files and preview API, data add-in (files, SQLite, MCP database
+                            # server, views, exports, agent tools), sandbox and secret masking
 cd frontend && npm run lint # TypeScript
 ```
 

@@ -79,7 +79,18 @@ export interface ReviewPart {
   checks?: Check[];
 }
 
-export type Part = TextPart | CompactionPart | ToolPart | PlanPart | ReviewPart;
+export interface ShellPart {
+  id: string;
+  type: 'shell';
+  command: string;
+  output: string;
+  exitCode: number | null;
+  status: 'running' | 'done' | 'error';
+  procId?: string;
+  hidden?: boolean;
+}
+
+export type Part = TextPart | CompactionPart | ToolPart | PlanPart | ReviewPart | ShellPart;
 
 export interface Message {
   id: string;
@@ -178,6 +189,7 @@ export interface Permission {
   messageId: string;
   partId: string;
   status: 'pending' | 'allowed' | 'rejected';
+  note?: string;
 }
 
 export interface QuestionPrompt { question: string; options: string[]; multiple: boolean }
@@ -207,7 +219,10 @@ export interface SessionSummary {
   flowTitle?: string | null;
   goalActive?: boolean;
   autoMode?: boolean | null;
+  permissionMode?: PermissionMode | null;
 }
+
+export type PermissionMode = 'ask' | 'acceptEdits' | 'auto';
 
 export interface Session extends SessionSummary {
   messages: Message[];
@@ -227,7 +242,63 @@ export interface Session extends SessionSummary {
   mcpDisabled?: string[];
   skillsUsed?: string[];
   mcpCalls?: Record<string, number>;
+  datasets?: DatasetMeta[];
 }
+
+/* ---- terminal, files, preview ---- */
+
+export interface ProcInfo {
+  id: string;
+  command: string;
+  cwd: string;
+  owner: 'user' | 'agent';
+  kind: 'terminal' | 'background' | 'shell';
+  runId: string | null;
+  startedAt: number;
+  endedAt: number | null;
+  exitCode: number | null;
+  status: 'running' | 'exited' | 'killed';
+  urls: string[];
+  size: number;
+  output?: string;
+}
+
+export interface TreeEntry { name: string; path: string; dir: boolean; size: number; mtime: number; ignored: boolean; symlink: boolean }
+
+export interface FileData { path: string; size: number; mtime: number; mime: string; binary: boolean; content: string | null; tooLarge: boolean; crlf: boolean }
+
+export interface UiShow { kind: 'file' | 'url'; path?: string; line?: number | null; preview?: boolean; url?: string; agent?: string }
+
+/* ---- data analysis ---- */
+
+export interface DataSource { id: string; kind: 'mcp' | 'sqlite' | 'file'; name: string; dialect?: string; queryTool?: string | null;
+  writeTool?: string | null; listTool?: string | null; table?: string; error?: string }
+
+export type FilterOp = 'eq' | 'neq' | 'contains' | 'not_contains' | 'starts' | 'ends' | 'gt' | 'gte' | 'lt' | 'lte' | 'empty' | 'not_empty' | 'in' | 'regex';
+
+export interface DataView {
+  filters: { column: string; op: FilterOp; value?: any }[];
+  sort: { column: string; desc: boolean }[];
+  hidden: string[];
+  search: string;
+}
+
+export interface DatasetMeta {
+  id: string; title: string; source: string; sql: string; columns: string[]; types: string[]; rowCount: number; truncated: boolean;
+  createdAt: number; elapsedMs: number; createdBy: 'user' | 'agent'; view: DataView; affected?: number;
+}
+
+export interface DataPage { dataset: DatasetMeta; columns: string[]; types: string[]; rows: any[][]; total: number; filtered: number; offset: number; limit: number }
+
+export interface ColumnProfile { column: string; type: string; count: number; nulls: number; distinct: number; top: [string, number][];
+  min?: any; max?: any; mean?: number; median?: number; std?: number; sum?: number; minLength?: number; maxLength?: number }
+
+export interface DataProfile { rows: number; duplicates: number; columns: ColumnProfile[] }
+
+export interface PrivacyEndpoint { kind: string; name: string; url: string; local: boolean; blocked: boolean; note: string }
+
+export interface PrivacyReport { localOnly: boolean; allowPackageManagers: boolean; endpoints: PrivacyEndpoint[]; token: boolean; host: string;
+  checks: { name: string; ok: boolean; detail: string }[] }
 
 /* ---- extensions: mods, MCP, skills, reverse engineering ---- */
 
@@ -391,12 +462,18 @@ export interface AppConfig {
   tiers: Record<Tier, { model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' }>;
   orchestratorModel: string;
   workspace: string;
+  permissionMode: PermissionMode;
+  network: { localOnly: boolean; allowPackageManagers: boolean };
+  data: { enabled: boolean; maxRows: number; previewRows: number };
+  terminal: { maxProcesses: number; shellTimeout: number };
   permissions: {
     edit: Perm;
     bash: Perm;
     webfetch: Perm;
     mcp: Perm;
     mods: Perm;
+    open: Perm;
+    data: Perm;
     bashRules: { pattern: string; action: Perm }[];
   };
   mcp: { deferThreshold: number; maxDescriptionChars: number; inPlanMode: boolean; inWorkers: boolean };
@@ -498,4 +575,12 @@ export type ServerEvent = { seq?: number } & (
   | { type: 'mods.ui'; modUi: ModUi }
   | { type: 'mods.toast'; mod: string; text: string; kind: ModToast['kind'] }
   | { type: 'mods.changed'; mods: ModInfo[] }
-  | { type: 'skills.changed' });
+  | { type: 'skills.changed' }
+  | { type: 'terminal.updated'; process: ProcInfo }
+  | { type: 'terminal.output'; procId: string; offset: number; chunk: string }
+  | { type: 'terminal.removed'; procId: string }
+  | { type: 'terminal.cwd'; cwd: string }
+  | { type: 'ui.show' } & UiShow
+  | { type: 'files.changed'; paths: string[] }
+  | { type: 'data.dataset'; dataset: DatasetMeta }
+  | { type: 'data.view'; datasetId: string; view: DataView; by: string });

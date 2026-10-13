@@ -83,7 +83,8 @@ def test_normalize_and_write_detection():
     for sql in ("SELECT 1", "with x as (select 1) select * from x", "  -- c\nselect * from t", "PRAGMA table_info(t)", "EXPLAIN SELECT 1"):
         assert not data.is_write(sql), sql
     for sql in ("DELETE FROM t", "update t set a=1", "select 1; drop table t", "PRAGMA journal_mode=WAL",
-                "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "CREATE TABLE x(a)", "SELECT * INTO backup FROM t"):
+                "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "CREATE TABLE x(a)", "SELECT * INTO backup FROM t",
+                "SELECT * FROM users INTO OUTFILE '/tmp/u.csv'", "ATTACH DATABASE 'x.db' AS x"):
         assert data.is_write(sql), sql
 
 
@@ -151,6 +152,14 @@ async def test_writes_need_confirmation_unless_auto(client, fake_server, workspa
     assert r.status_code == 200
     r = await client.post(f"/api/sessions/{sid}/data/query", json={"source": "file:none.csv", "sql": "SELECT 1"})
     assert r.status_code == 400
+    # Even confirmed / in Auto mode, SQL cannot read or create database files outside the project.
+    outside = workspace.parent / "outside.db"
+    (workspace / "t.csv").write_text("a\n1\n")
+    for source in ("sqlite:shop.db", "file:t.csv"):
+        for sql in (f"ATTACH DATABASE '{outside.as_posix()}' AS x", f"VACUUM INTO '{outside.as_posix()}'"):
+            r = await client.post(f"/api/sessions/{sid}/data/query", json={"source": source, "sql": sql, "confirmWrite": True})
+            assert r.status_code == 400, (source, sql, r.text)
+    assert not outside.exists()
 
 
 # ---------------------------------------------------------------------------

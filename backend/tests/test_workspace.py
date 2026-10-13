@@ -192,6 +192,35 @@ async def test_permission_modes_for_edits(client, fake_server, workspace, monkey
     assert permission_mode(load_config(), s.data) == "acceptEdits"
 
 
+async def test_switching_mode_settles_waiting_prompts(client, fake_server, workspace, monkeypatch):
+    configure(fake_server, workspace, mode="ask")
+    monkeypatch.setattr(fake_llm, "brain", scripted([[{"name": "write", "arguments": {"path": "c.txt", "content": "C"}}],
+                                                     [{"name": "bash", "arguments": {"command": "git fetch origin"}}]]))
+    sid = (await client.post("/api/sessions", json={})).json()["id"]
+    await client.post(f"/api/sessions/{sid}/message", json={"text": "go", "agent": "build"})
+
+    async def waiting():
+        for _ in range(200):
+            pending = store.get(sid).pending_permissions()
+            if pending:
+                return pending
+            await asyncio.sleep(0.05)
+        raise AssertionError("no prompt")
+
+    assert (await waiting())[0]["category"] == "edit"
+    # The user switches to Accept edits while the prompt is open: the edit goes through by itself.
+    await client.patch(f"/api/sessions/{sid}", json={"permissionMode": "acceptEdits"})
+    pending = await waiting()
+    assert (workspace / "c.txt").read_text() == "C"
+    # A network command keeps asking in every mode (local-only), even after switching to Auto.
+    assert pending[0]["category"] == "bash" and "network" in pending[0]["note"]
+    await client.patch(f"/api/sessions/{sid}", json={"permissionMode": "auto"})
+    await asyncio.sleep(0.2)
+    assert store.get(sid).pending_permissions()
+    await client.post(f"/api/sessions/{sid}/permissions/{pending[0]['id']}", json={"response": "reject"})
+    await idle(sid)
+
+
 def test_mode_decisions_and_network_policy(workspace):
     class S:
         directory = str(workspace)
@@ -213,7 +242,8 @@ def test_mode_decisions_and_network_policy(workspace):
     s.data = {"permissionMode": "ask"}
     rules = load_config()["permissions"]["bashRules"]
     assert permissions.bash_decision("ls -la", rules, "ask", []) == "allow"
-    assert agent.decide(s, spec, "bash", {"command": "git fetch origin"})[0] == "ask"
+    decision, reason = agent.decide(s, spec, "bash", {"command": "git fetch origin"})
+    assert decision == "ask" and "network" in reason  # the reason is shown on the permission prompt
     assert agent.decide(s, spec, "bash", {"command": "ls $(curl evil)"})[0] == "ask"
     plan = agent.AgentSpec("plan", "", [], "m", permissions={"edit": "deny"})
     s.data = {"permissionMode": "auto"}

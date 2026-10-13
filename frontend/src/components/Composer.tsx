@@ -1,11 +1,12 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUp, Bot, ListPlus, Square, Target, X } from 'lucide-react';
-import type { AgentMode, CommandInfo, Goal } from '../types';
+import { ArrowUp, Bot, ListPlus, ShieldCheck, Square, SquareTerminal, Target, X, Zap } from 'lucide-react';
+import type { AgentMode, CommandInfo, Goal, PermissionMode } from '../types';
 import { useT, type Strings } from '../i18n';
 import { api } from '../api';
 import { agentColor, cx, fmtTokens } from '../util';
 
 export const AGENT_ORDER: AgentMode[] = ['build', 'plan', 'flow'];
+export const MODE_ORDER: PermissionMode[] = ['ask', 'acceptEdits', 'auto'];
 
 export const COMMANDS: { name: string; desc: keyof Strings; arg?: boolean }[] = [
   { name: 'flow', desc: 'cmdFlow', arg: true },
@@ -18,6 +19,10 @@ export const COMMANDS: { name: string; desc: keyof Strings; arg?: boolean }[] = 
   { name: 'compact', desc: 'cmdCompact' },
   { name: 'fork', desc: 'cmdFork' },
   { name: 'auto', desc: 'cmdAuto' },
+  { name: 'terminal', desc: 'cmdTerminal' },
+  { name: 'files', desc: 'cmdFiles' },
+  { name: 'preview', desc: 'cmdPreview' },
+  { name: 'data', desc: 'cmdData' },
   { name: 'activity', desc: 'cmdActivity' },
   { name: 'report', desc: 'cmdReport' },
   { name: 'agents', desc: 'cmdAgents' },
@@ -50,7 +55,7 @@ const draftKey = (sid: string | null) => `orch:draft:${sid || 'new'}`;
 type Item = { key: string; label: string; hint?: string; apply: () => void };
 
 export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbort, onCommand, model, answering, inject,
-  queued, onRemoveQueued, contextTokens, contextWindow, totalTokens, compactions, goal, autonomous, onToggleAuto, onClearGoal,
+  queued, onRemoveQueued, contextTokens, contextWindow, totalTokens, compactions, goal, mode, onModeChange, onShell, onClearGoal,
   serverCommands = [], footerExtra }: {
   sessionId: string | null;
   agent: AgentMode;
@@ -69,8 +74,9 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
   totalTokens: number;
   compactions: number;
   goal: Goal | null | undefined;
-  autonomous: boolean;
-  onToggleAuto: () => void;
+  mode: PermissionMode;
+  onModeChange: (mode: PermissionMode) => void;
+  onShell: (command: string) => void;
   onClearGoal: () => void;
   serverCommands?: CommandInfo[];
   footerExtra?: ReactNode;
@@ -116,6 +122,7 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
     }
   }, [inject]);
 
+  const shellMode = text.startsWith('!');
   const mention = /(^|\s)@([\w./-]*)$/.exec(text);
   const slash = /^\/([\w-]*)$/.exec(text);
 
@@ -176,6 +183,14 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
   const submit = () => {
     const value = text.trim();
     if (!value) return;
+    if (value.startsWith('!')) {
+      if (!value.slice(1).trim()) return;
+      setText('');
+      setHistIdx(null);
+      pushHistory(value);
+      onShell(value.slice(1).trim());
+      return;
+    }
     const cmd = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(value);
     if (cmd && COMMANDS.some((c) => c.name === cmd[1]) && cmd[1] !== 'flow') {
       setText('');
@@ -219,6 +234,12 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
     if (e.key === 'ArrowDown' && histIdx !== null && el.selectionStart === text.length) {
       if (browseHistory(1)) { e.preventDefault(); return; }
     }
+    if (e.key === 'Tab' && e.shiftKey) {
+      e.preventDefault();
+      onModeChange(MODE_ORDER[(MODE_ORDER.indexOf(mode) + 1) % MODE_ORDER.length]);
+      return;
+    }
+    if (e.key === 'Escape' && shellMode && !busy) { e.preventDefault(); setText(''); return; }
     if (e.key === 'Tab' && !e.shiftKey) {
       e.preventDefault();
       onAgentChange(AGENT_ORDER[(AGENT_ORDER.indexOf(agent) + 1) % AGENT_ORDER.length]);
@@ -228,9 +249,12 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); }
   };
 
-  const color = agentColor(agent);
+  const color = shellMode ? 'var(--warn)' : agentColor(agent);
   const agentLabel = agent === 'build' ? t.agentBuild : agent === 'plan' ? t.agentPlan : t.agentFlow;
   const placeholder = answering ? t.placeholderAnswer : agent === 'plan' ? t.placeholderPlan : agent === 'flow' ? t.placeholderFlow : t.placeholderBuild;
+  const modeLabel = mode === 'auto' ? t.modeAuto : mode === 'acceptEdits' ? t.modeAcceptEdits : t.modeAsk;
+  const modeHint = `${mode === 'auto' ? t.modeAutoHint : mode === 'acceptEdits' ? t.modeAcceptEditsHint : t.modeAskHint} ${t.modeCycle}.`;
+  const ModeIcon = mode === 'auto' ? Bot : mode === 'acceptEdits' ? Zap : ShieldCheck;
   const ctxRatio = contextWindow ? Math.min(1, contextTokens / contextWindow) : 0;
   const ctxColor = ctxRatio > 0.75 ? 'var(--err)' : ctxRatio > 0.5 ? 'var(--warn)' : 'var(--ok)';
 
@@ -266,18 +290,18 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
       )}
       <div className="rounded-md border bg-panel transition-colors focus-within:bg-elev" style={{ borderColor: `color-mix(in srgb, ${color} 55%, var(--line))` }}>
         <div className="flex items-end gap-2 px-3 pt-2.5">
-          <span className="select-none pb-1 font-bold" style={{ color }}>›</span>
+          <span className="select-none pb-1 font-bold" style={{ color }} title={shellMode ? t.shellModeHint : undefined}>{shellMode ? '!' : '›'}</span>
           <textarea
             ref={ref}
             rows={1}
             value={text}
             onChange={(e) => { setText(e.target.value); setHistIdx(null); }}
             onKeyDown={onKeyDown}
-            placeholder={placeholder}
-            aria-label={placeholder}
+            placeholder={shellMode ? t.shellPlaceholder : placeholder}
+            aria-label={shellMode ? t.shellPlaceholder : placeholder}
             className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-0.5 text-fg outline-none placeholder:text-faint focus-visible:outline-none"
           />
-          {busy && !text.trim() ? (
+          {busy && !text.trim() && !shellMode ? (
             <button type="button" onClick={onAbort} title={t.stop} className="mb-0.5 rounded bg-err/80 p-1.5 text-bg hover:bg-err">
               <Square size={13} fill="currentColor" />
             </button>
@@ -304,9 +328,16 @@ export function Composer({ sessionId, agent, onAgentChange, busy, onSend, onAbor
               <button type="button" onClick={onClearGoal} title={t.clearGoal} className="opacity-60 hover:opacity-100"><X size={10} /></button>
             </span>
           )}
-          <button type="button" onClick={onToggleAuto} title={t.autonomousHint} aria-pressed={autonomous}
-            className={cx('flex shrink-0 items-center gap-1 rounded border px-1', autonomous ? 'border-warn/60 bg-warn/10 text-warn' : 'border-line text-faint hover:text-fg')}>
-            <Bot size={11} /> {t.autonomous}
+          {shellMode ? (
+            <span className="flex shrink-0 items-center gap-1 rounded border border-warn/60 bg-warn/10 px-1 text-warn" title={t.shellModeHint}>
+              <SquareTerminal size={11} /> shell
+            </span>
+          ) : null}
+          <button type="button" onClick={() => onModeChange(MODE_ORDER[(MODE_ORDER.indexOf(mode) + 1) % MODE_ORDER.length])} title={modeHint}
+            aria-label={`Permission mode: ${modeLabel}`}
+            className={cx('flex shrink-0 items-center gap-1 rounded border px-1', mode === 'auto' ? 'border-warn/60 bg-warn/10 text-warn'
+              : mode === 'acceptEdits' ? 'border-accent/60 bg-accent/10 text-accent' : 'border-line text-faint hover:text-fg')}>
+            <ModeIcon size={11} /> {modeLabel}
           </button>
           {footerExtra}
           {busy && <span className="pulse shrink-0 text-accent">{t.working}</span>}

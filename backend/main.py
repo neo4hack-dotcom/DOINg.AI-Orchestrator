@@ -17,9 +17,9 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response, Streami
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import bitbucket, compaction, data_api, journal, llm, mcp_tools, mods, prompts, report, security, skills, workspace_api
+from . import bitbucket, compaction, data_api, journal, llm, mcp_tools, mods, netguard, prompts, report, security, skills, workspace_api
 from .processes import manager as processes
-from .agent import AgentSpec, _manage_context, make_context, run_agent
+from .agent import AgentSpec, _manage_context, make_context, run_agent, settle_pending
 from .config import (CONFIG_FILE, PERMISSION_MODES, ROOT_DIR, auto_mode, load_config, mask_server, permission_mode, public_config, read_nexus_llm_config,
                      remember_project, save_config, strip_masked, unmask_server, update_config)
 from .mcp_client import manager as mcp_manager
@@ -158,6 +158,33 @@ async def health() -> dict:
 @app.get("/api/config")
 async def get_config() -> dict:
     return public_config(load_config())
+
+
+@app.get("/api/privacy")
+async def privacy() -> dict:
+    """What leaves this machine: every configured destination, plus the protections in force."""
+    cfg = load_config()
+    endpoints = netguard.describe(cfg)
+    host = os.environ.get("ORCH_BIND_HOST", "127.0.0.1")
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    mode = permission_mode(cfg)
+    checks = [
+        {"name": "No telemetry", "ok": True, "detail": "The app sends no analytics, crash reports or update checks."},
+        {"name": "Local-only mode", "ok": netguard.local_only(cfg),
+         "detail": "Every request the app makes is checked: only this machine and private networks are reachable."
+         if netguard.local_only(cfg) else "Off: the LLM, MCP servers and webfetch may reach the internet."},
+        {"name": "Every endpoint is local", "ok": all(e["local"] or e["blocked"] for e in endpoints),
+         "detail": ", ".join(e["name"] for e in endpoints if not e["local"] and not e["blocked"]) or "Nothing configured goes to the internet."},
+        {"name": "Server reachable from this machine only", "ok": loopback or bool(security.token()),
+         "detail": f"Bound to {host}." + ("" if loopback else (" Reachable from the network, protected by an access token." if security.token()
+                                                              else " Reachable from the network WITHOUT a token: restart with --token."))},
+        {"name": "Requests from other websites blocked", "ok": True, "detail": "Host allowlist (DNS rebinding) and Origin checks (CSRF) on every API call."},
+        {"name": "Confirmation before actions", "ok": mode != "auto",
+         "detail": {"ask": "Edits, commands, app launches and data writes ask first.", "acceptEdits": "File edits apply directly; commands still ask.",
+                    "auto": "Auto mode: agents act without asking (deny rules and local-only still apply)."}[mode]},
+    ]
+    return {"localOnly": netguard.local_only(cfg), "allowPackageManagers": bool((cfg.get("network") or {}).get("allowPackageManagers", True)),
+            "endpoints": endpoints, "token": bool(security.token()), "host": host, "checks": checks}
 
 
 @app.put("/api/config")
@@ -318,11 +345,13 @@ async def patch_session(sid: str, body: SessionPatch) -> dict:
         s.data["autoMode"] = body.autoMode
         s.data["permissionMode"] = "auto" if body.autoMode else None
         journal.log(s, "auto_mode", value=s.data["autoMode"])
+        settle_pending(s, permission_mode(load_config(), s.data))
     if "permissionMode" in body.model_fields_set:
         mode = body.permissionMode if body.permissionMode in PERMISSION_MODES else None
         s.data["permissionMode"] = mode
         s.data["autoMode"] = None if mode is None else mode == "auto"
         journal.log(s, "permission_mode", value=mode or "default")
+        settle_pending(s, permission_mode(load_config(), s.data))
     if body.mcpDisabled is not None:
         s.data["mcpDisabled"] = sorted({str(x) for x in body.mcpDisabled})
         journal.log(s, "mcp", disabled=s.data["mcpDisabled"])

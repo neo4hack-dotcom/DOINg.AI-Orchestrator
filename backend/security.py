@@ -32,7 +32,7 @@ COOKIE = "sc_token"
 APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
            "font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
            "frame-ancestors 'self'; frame-src 'self' http://localhost:* http://127.0.0.1:* https://localhost:* "
-           "https://127.0.0.1:* http://[::1]:*")
+           "https://127.0.0.1:* http://*.localhost:*")
 # Workspace files shown in the preview: sandboxed (opaque origin, cannot call the API), no remote loads.
 PREVIEW_CSP = ("sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; default-src 'self' data: blob: "
                "'unsafe-inline' 'unsafe-eval'; connect-src 'self'; frame-ancestors 'self'")

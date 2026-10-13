@@ -95,10 +95,11 @@ async def _wait_user(session: Session, registry: str, entry: dict) -> str:
 
 
 async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: dict, category: str, agent: str,
-                         grant: Optional[str] = None) -> str:
+                         grant: Optional[str] = None, note: str = "", forced: bool = False) -> str:
     entry = {
         "id": new_id("perm"), "category": category, "tool": part["tool"], "input": part["input"], "agent": agent,
         "runId": sink.run_id, "messageId": msg["id"], "partId": part["id"], "status": "pending", "createdAt": now_ms(),
+        "note": note, "forced": forced,
     }
     session.data.setdefault("permissionLog", []).append(entry)
     part["permissionId"] = entry["id"]
@@ -114,6 +115,20 @@ async def ask_permission(session: Session, sink: MessageSink, msg: dict, part: d
                 target=str(part["input"].get("command") or part["input"].get("path") or "")[:200])
     session.touch()
     return response
+
+
+def settle_pending(session: Session, mode: str) -> int:
+    """The user switched the session to a more permissive mode: prompts that mode no longer asks are approved
+    (Claude Code behaviour). Prompts every mode asks (network commands, agent-level "ask") stay."""
+    settled = 0
+    for entry in session.data.get("permissionLog", []):
+        fut = session.permissions.get(entry.get("id"))
+        if entry.get("status") != "pending" or not fut or fut.done() or entry.get("forced") or entry.get("note"):
+            continue
+        if mode == "auto" or (mode == "acceptEdits" and entry.get("category") == "edit"):
+            fut.set_result("once")
+            settled += 1
+    return settled
 
 
 async def ask_questions(session: Session, agent: str, run_id: Optional[str], questions: list[dict]) -> list[list[str]]:
@@ -191,7 +206,8 @@ def decide(session: Session, spec: AgentSpec, category: Optional[str], args: dic
             if mode == "auto":
                 return "deny", ("local-only mode: commands that reach the network are never run unattended. Ask the user to run "
                                 "it in the terminal, or to turn local-only mode off in Settings > Privacy & security")
-            return "ask", "network command"
+            return "ask", ("this command reaches the network (local-only mode is on)" if kind == "network"
+                           else "this command installs packages from the network")
     elif category == "edit":
         if cfg.get("edit") == "deny":
             return "deny", "file edits are denied in Settings > Workspace"
@@ -278,7 +294,8 @@ async def execute_tool(session: Session, sink: MessageSink, msg: dict, spec: Age
         if decision == "ask":
             part["status"] = "waiting"
             sink.update_part(msg, part)
-            answer = await ask_permission(session, sink, msg, part, category, spec.name, _grant_for(tool, a))
+            answer = await ask_permission(session, sink, msg, part, category, spec.name, _grant_for(tool, a), reason,
+                                         spec.permissions.get(category) == "ask")
             if answer == "reject":
                 return {"ok": False, "display": "Rejected by user",
                         "output": "The user rejected this tool call. Do not retry it; adapt your approach or ask the user."}

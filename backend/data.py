@@ -73,7 +73,8 @@ def is_write(sql: str) -> bool:
             return True
         if kw in ("with", "explain") and re.search(r"\b(insert|update|delete|merge|drop|alter|create|truncate|replace)\b", stmt, re.I):
             return True
-        if kw == "select" and re.search(r"\binto\b\s+[\w\"`\[]", stmt, re.I) and not re.search(r"\binto\s+(outfile|dumpfile)\b", stmt, re.I):
+        # SELECT ... INTO creates a table (PostgreSQL, SQL Server) or writes a file on the server (MySQL OUTFILE / DUMPFILE).
+        if kw == "select" and re.search(r"\binto\b", stmt, re.I):
             return True
     return False
 
@@ -373,10 +374,17 @@ def _table_name(path: Path) -> str:
     return name if not name[0].isdigit() else f"t_{name}"
 
 
+def _no_other_files(action: int, *_args) -> int:
+    """SQLite authorizer: ATTACH / VACUUM INTO would read or create database files anywhere on disk, outside the
+    project the agents are confined to."""
+    return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK
+
+
 def _sqlite_run(db: str, sql: str, max_rows: int, write: bool, timeout: float = 30.0, uri: bool = True) -> tuple[list[str], list[list], bool, int]:
     deadline = time.monotonic() + timeout
     conn = sqlite3.connect(db, uri=uri, timeout=10, check_same_thread=False)
     try:
+        conn.set_authorizer(_no_other_files)
         conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10000)
         cur = conn.cursor()
         statements = [s for s in re.split(r";\s*(?=(?:[^']*'[^']*')*[^']*$)", sql) if s.strip()]
@@ -583,7 +591,10 @@ def _load_file_db(path: Path, max_rows: int) -> tuple[sqlite3.Connection, str]:
 def _query_file(path: Path, sql: str, max_rows: int) -> tuple[list[str], list[list], bool, int]:
     limit = int(load_config()["data"].get("maxRows") or 5000) * 20
     conn, _table = _load_file_db(path, limit)
+    deadline = time.monotonic() + 30
     try:
+        conn.set_authorizer(_no_other_files)
+        conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10000)
         cur = conn.execute(sql)
         columns = [d[0] for d in cur.description or []]
         rows = cur.fetchmany(max_rows + 1)
@@ -1015,7 +1026,8 @@ def to_xlsx(ds: dict, scope: str = "view", sheet: str = "Data") -> bytes:
 
 
 def export_bytes(ds: dict, fmt: str, scope: str = "view") -> tuple[bytes, str, str]:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", ds.get("title") or ds["id"]).strip("-")[:60] or ds["id"]
+    title = re.sub(r"\.(csv|tsv|xlsx|json|jsonl|ndjson|db|sqlite3?)$", "", ds.get("title") or "", flags=re.I)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", title or ds["id"]).strip("-.")[:60] or ds["id"]
     if fmt == "xlsx":
         return to_xlsx(ds, scope), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"{safe}.xlsx"
     if fmt == "json":

@@ -279,6 +279,7 @@ def _sanitize(cfg: dict) -> dict:
     cfg["data"]["maxRows"] = max(10, min(200_000, int(cfg["data"].get("maxRows") or 5000)))
     cfg["data"]["previewRows"] = max(3, min(100, int(cfg["data"].get("previewRows") or 15)))
     cfg["terminal"]["maxProcesses"] = max(1, min(32, int(cfg["terminal"].get("maxProcesses") or 8)))
+    cfg["terminal"]["shellTimeout"] = max(5, min(3600, int(cfg["terminal"].get("shellTimeout") or 120)))
     rev = cfg["reverse"]
     # The version ends up in a command line: a package version or dist-tag only.
     if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,40}", str(rev.get("version") or "")):
@@ -369,10 +370,13 @@ SECRET_KEY = re.compile(r"(key|token|secret|passw|auth|credential|cookie|session
 
 
 URL_CREDENTIALS = re.compile(r"(://[^:/@\s]+:)([^@/\s]+)(@)")
+# ?token=x / &api_key=x / ;password=x in URLs and connection strings
+QUERY_SECRET = re.compile(r"([?&;](?:[\w.-]*(?:key|token|secret|passw|pwd|auth|credential|signature|sig))=)([^&;#\s]+)", re.I)
 
 
 def _mask_text(value: str, previous: str = "") -> str:
     value = URL_CREDENTIALS.sub(lambda m: m.group(1) + SECRET + m.group(3), value)
+    value = QUERY_SECRET.sub(lambda m: m.group(1) + SECRET, value)
     m = re.match(r"^(--?[\w-]+=)(.+)$", value)
     if m and SECRET_KEY.search(m.group(1)):
         return m.group(1) + SECRET
